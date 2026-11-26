@@ -1,10 +1,11 @@
 // State coordination and event wiring.
-import { openDatabase, getState, createQuest, completeQuest, setDifficultyMode, exportData, importData, DuplicateCompletionError } from './db.js';
+import { openDatabase, getState, createQuest, updateQuest, changeQuestStatus, deleteQuest, completeQuest, setDifficultyMode, setWeeklyTarget, exportData, importData, DuplicateCompletionError } from './db.js';
 import { levelFromXp, localDayKey } from './gameLogic.js';
 import * as ui from './ui.js';
 
 let db;
-const state = { screen: 'home', filter: 'all', data: null };
+const state = { screen: 'home', filter: 'all', showAnyway: false, expanded: new Set(), editId: null, data: null };
+const $ = (id) => document.getElementById(id);
 
 async function refresh() {
   state.data = await getState(db);
@@ -13,13 +14,16 @@ async function refresh() {
 }
 function render() {
   const s = { ...state.data, now: new Date() };
-  ui.renderHome(s, { filter: state.filter, onFilter, onComplete, onNew });
-  ui.renderProfile(s, { onMode, onExport, onImport });
+  ui.renderHome(s, { filter: state.filter, showAnyway: state.showAnyway, expanded: state.expanded,
+    onFilter, onComplete, onNew, onEdit, onStatus, onDelete, onExpand, onToggleRest });
+  ui.renderProfile(s, { onMode, onTarget, onExport, onImport });
   ui.showScreen(state.screen);
 }
 const guard = (fn) => async (...a) => { try { await fn(...a); } catch (e) { ui.toast(e.message || 'Something went wrong.', true); } };
 
 function onFilter(f) { state.filter = f; render(); }
+function onExpand(id) { state.expanded.add(id); render(); }
+function onToggleRest() { state.showAnyway = !state.showAnyway; render(); }
 
 const onComplete = guard(async (q) => {
   if (!(await ui.confirmDialog('Complete this quest?', `"${q.title}" will award ${q.xpReward} XP.`, 'Complete'))) return;
@@ -31,14 +35,41 @@ const onComplete = guard(async (q) => {
   ui.toast(after > before ? `Level up! You reached level ${after}.` : `+${q.xpReward} XP earned.`);
 });
 
-function onNew() {
-  const d = document.getElementById('quest-dialog');
-  d.querySelector('form').reset();
+function openQuestDialog(q) {
+  const d = $('quest-dialog'), f = $('quest-form');
+  state.editId = q ? q.id : null;
+  f.reset();
+  if (q) {
+    f.title.value = q.title; f.finishCondition.value = q.finishCondition || ''; f.type.value = q.type;
+    f.attributeId.value = q.attributeId; f.effortTier.value = q.effortTier; f.isGoldEligible.checked = q.isGoldEligible !== false;
+  }
+  $('quest-dialog-title').textContent = q ? 'Edit quest' : 'New quest';
+  $('quest-submit').textContent = q ? 'Save changes' : 'Create quest';
   d.returnValue = '';
   d.showModal();
 }
+const onNew = () => openQuestDialog(null);
+const onEdit = (q) => openQuestDialog(q);
 
-const onMode = guard(async (m) => { await setDifficultyMode(db, m); await refresh(); });
+const STATUS_TOAST = { pause: 'Quest paused.', resume: 'Quest resumed.', archive: 'Quest archived.', restore: 'Quest restored.' };
+const onStatus = guard(async (q, action) => {
+  await changeQuestStatus(db, q.id, action);
+  await refresh();
+  ui.toast(STATUS_TOAST[action]);
+});
+
+const onDelete = guard(async (q) => {
+  const ok = await ui.confirmDialog('Delete this quest permanently?',
+    `"${q.title}" will be permanently removed from your quests. Your completion history, XP and Gold records are kept. This cannot be undone.`, 'Delete quest');
+  if (!ok) return;
+  await deleteQuest(db, q.id);
+  state.expanded.delete(q.id);
+  await refresh();
+  ui.toast('Quest deleted. Your history is kept.');
+});
+
+const onMode = guard(async (m) => { await setDifficultyMode(db, m); state.showAnyway = false; await refresh(); });
+const onTarget = guard(async (n) => { await setWeeklyTarget(db, n); await refresh(); ui.toast('Weekly target updated.'); });
 
 const onExport = guard(async () => {
   const blob = new Blob([JSON.stringify(await exportData(db), null, 2)], { type: 'application/json' });
@@ -48,21 +79,22 @@ const onExport = guard(async () => {
   ui.toast('Backup exported.');
 });
 
-const onImport = () => document.getElementById('import-file').click();
+const onImport = () => $('import-file').click();
 
 async function init() {
   ui.fillQuestForm();
   document.querySelectorAll('.tabs button').forEach((b) => b.addEventListener('click', () => { state.screen = b.dataset.screen; render(); }));
 
-  document.getElementById('quest-dialog').addEventListener('close', guard(async (e) => {
+  $('quest-dialog').addEventListener('close', guard(async (e) => {
     if (e.target.returnValue !== 'ok') return;
-    const f = document.getElementById('quest-form');
-    await createQuest(db, { title: f.title.value, finishCondition: f.finishCondition.value, type: f.type.value, attributeId: f.attributeId.value, effortTier: f.effortTier.value });
-    await refresh();
-    ui.toast('Quest created.');
+    const f = $('quest-form');
+    const fields = { title: f.title.value, finishCondition: f.finishCondition.value, type: f.type.value, attributeId: f.attributeId.value,
+      effortTier: f.effortTier.value, isGoldEligible: f.isGoldEligible.checked };
+    if (state.editId) { await updateQuest(db, state.editId, fields); await refresh(); ui.toast('Quest updated. Past completions are unchanged.'); }
+    else { await createQuest(db, fields); await refresh(); ui.toast('Quest created.'); }
   }));
 
-  const input = document.getElementById('import-file');
+  const input = $('import-file');
   input.addEventListener('change', guard(async () => {
     const file = input.files[0];
     input.value = '';
