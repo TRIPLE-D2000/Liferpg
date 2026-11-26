@@ -95,3 +95,17 @@ export function weeklyConsistency(completions, now = new Date(), target = 4, wee
     : 'Good progress. Every active day counts.';
   return { count, target, days, reached, message, pct: Math.min(100, Math.round((100 * count) / target)) };
 }
+
+// ---- Gold (Phase 3) ---------------------------------------------------------
+export const GOLD_BY_TIER = { small: 5, standard: 10, meaningful: 25, major: 50 };
+export function goldForTier(tier) {
+  const g = GOLD_BY_TIER[tier];
+  if (g === undefined) throw new Error(`Unknown effort tier: ${tier}`);
+  return g;
+}
+// Gold only for Gold-eligible quests completed outside Rest mode. XP is never affected by this.
+export function goldAwardFor(quest, mode) {
+  return quest.isGoldEligible === false || mode === 'rest' ? 0 : goldForTier(quest.effortTier);
+}
+// The balance is never stored: it is always the sum of the immutable ledger.
+export const goldBalance = (ledger) => ledger.reduce((n, l) => n + l.amount, 0);
