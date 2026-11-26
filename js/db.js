@@ -2,9 +2,9 @@
 import { EFFORT_TIERS, QUEST_TYPES, MODES, DEFAULT_ATTRIBUTES, periodKeyFor, xpForTier } from './gameLogic.js';
 
 export const DB_NAME = 'life_rpg';
-export const DB_VERSION = 1;
+export const DB_VERSION = 3;
 export const EXPORT_FORMAT_VERSION = 1;
-const STORES = ['profile', 'attributes', 'quests', 'completions'];
+const STORES = ['profile', 'attributes', 'quests', 'completions', 'currencyLedger', 'rewards', 'redemptions'];
 
 export class DuplicateCompletionError extends Error {
   constructor() { super('Already completed for this period.'); this.name = 'DuplicateCompletionError'; }
@@ -24,8 +24,13 @@ export function openDatabase(name = DB_NAME) {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(name, DB_VERSION);
     req.onupgradeneeded = (e) => {
-      const db = req.result;
-      if (e.oldVersion < 1) {
+      const db = req.result, tx = req.transaction, old = e.oldVersion;
+      // Backfill helper: rewrites existing rows in place; never clears or recreates a store.
+      const backfill = (store, fn) => {
+        const cur = tx.objectStore(store).openCursor();
+        cur.onsuccess = () => { const c = cur.result; if (!c) return; const v = fn(c.value); if (v) c.update(v); c.continue(); };
+      };
+      if (old < 1) { // Phase 1 schema
         db.createObjectStore('profile', { keyPath: 'id' });
         db.createObjectStore('attributes', { keyPath: 'id' });
         db.createObjectStore('quests', { keyPath: 'id' });
@@ -33,7 +38,29 @@ export function openDatabase(name = DB_NAME) {
         c.createIndex('byQuestPeriod', ['questId', 'periodKey'], { unique: true });
         c.createIndex('byCompletedAt', 'completedAt');
       }
-      // Future versions: add `if (e.oldVersion < 2) { ... }` blocks here.
+      if (old < 3) { // Phase 3: Gold ledger, rewards, redemptions
+        const l = db.createObjectStore('currencyLedger', { keyPath: 'id' });
+        l.createIndex('byTransactionKey', 'transactionKey', { unique: true });
+        l.createIndex('byCompletion', 'relatedCompletionId');
+        l.createIndex('byRedemption', 'relatedRedemptionId');
+        l.createIndex('byCreatedAt', 'createdAt');
+        const r = db.createObjectStore('rewards', { keyPath: 'id' });
+        r.createIndex('byCreatedAt', 'createdAt');
+        const d = db.createObjectStore('redemptions', { keyPath: 'id' });
+        d.createIndex('byRewardId', 'rewardId');
+        d.createIndex('byRedeemedAt', 'redeemedAt');
+      }
+      // Backfill existing rows ONCE per store (two cursors on one store would overwrite each other).
+      // Old completions are never touched, so no retroactive Gold is created.
+      if (old >= 1 && old < 3) {
+        backfill('profile', (p) => (p.weeklyTargetDays === undefined ? { ...p, weeklyTargetDays: 4 } : null));
+        backfill('quests', (q) => {
+          const n = { ...q };
+          if (n.updatedAt === undefined) n.updatedAt = n.createdAt;
+          if (n.isGoldEligible === undefined) n.isGoldEligible = true;
+          return n.updatedAt !== q.updatedAt || n.isGoldEligible !== q.isGoldEligible ? n : null;
+        });
+      }
     };
     req.onsuccess = () => seedIfEmpty(req.result).then(() => resolve(req.result), reject);
     req.onerror = () => reject(req.error);
@@ -45,7 +72,7 @@ async function seedIfEmpty(db) {
   const existing = await wrap(tx.objectStore('profile').get('player_1'));
   if (!existing) {
     const now = new Date().toISOString();
-    tx.objectStore('profile').add({ id: 'player_1', displayName: 'Player', totalXp: 0, difficultyMode: 'normal', createdAt: now, updatedAt: now });
+    tx.objectStore('profile').add({ id: 'player_1', displayName: 'Player', totalXp: 0, difficultyMode: 'normal', weeklyTargetDays: 4, createdAt: now, updatedAt: now });
     DEFAULT_ATTRIBUTES.forEach((a) => tx.objectStore('attributes').add({ ...a, totalXp: 0 }));
   }
   await txDone(tx);
@@ -53,8 +80,9 @@ async function seedIfEmpty(db) {
 
 export async function getState(db) {
   const tx = db.transaction(STORES, 'readonly');
-  const [profiles, attributes, quests, completions] = await Promise.all(STORES.map((s) => wrap(tx.objectStore(s).getAll())));
-  return { profile: profiles[0], attributes, quests, completions };
+  const [profiles, attributes, quests, completions, currencyLedger, rewards, redemptions] =
+    await Promise.all(STORES.map((st) => wrap(tx.objectStore(st).getAll())));
+  return { profile: profiles[0], attributes, quests, completions, currencyLedger, rewards, redemptions };
 }
 
 export async function createQuest(db, { title, finishCondition = '', type, effortTier, attributeId }) {
@@ -64,7 +92,8 @@ export async function createQuest(db, { title, finishCondition = '', type, effor
   const xpReward = xpForTier(effortTier);
   const tx = db.transaction(['attributes', 'quests'], 'readwrite');
   if (!(await wrap(tx.objectStore('attributes').get(attributeId)))) { tx.abort(); throw new Error('Unknown attribute.'); }
-  const quest = { id: newId(), title, finishCondition: (finishCondition || '').trim(), type, effortTier, attributeId, xpReward, status: 'active', createdAt: new Date().toISOString() };
+  const quest = { id: newId(), title, finishCondition: (finishCondition || '').trim(), type, effortTier, attributeId, xpReward, status: 'active', isGoldEligible: true, createdAt: new Date().toISOString() };
+  quest.updatedAt = quest.createdAt;
   tx.objectStore('quests').add(quest);
   await txDone(tx);
   return quest;
@@ -124,26 +153,45 @@ export async function exportData(db) {
   const s = await getState(db);
   return {
     app: 'life-rpg', schemaVersion: DB_VERSION, exportFormatVersion: EXPORT_FORMAT_VERSION, exportedAt: new Date().toISOString(),
-    data: { profile: [s.profile], attributes: s.attributes, quests: s.quests, completions: s.completions },
+    data: { profile: [s.profile], attributes: s.attributes, quests: s.quests, completions: s.completions,
+      currencyLedger: s.currencyLedger, rewards: s.rewards, redemptions: s.redemptions },
   };
 }
 
-// Throws BackupValidationError; never touches the database.
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// v1/v2/v3 backup -> v3-shaped data with safe defaults. Never invents Gold or ledger rows.
+export function upgradeBackup(b) {
+  const d = b.data, fill = (list, defaults) => list.map((r) => (isObj(r) ? { ...defaults(r), ...r } : r));
+  return {
+    profile: fill(d.profile, () => ({ weeklyTargetDays: 4 })),
+    attributes: d.attributes,
+    quests: fill(d.quests, (q) => ({ isGoldEligible: true, updatedAt: q.createdAt })),
+    completions: d.completions,
+    currencyLedger: d.currencyLedger ?? [], rewards: d.rewards ?? [], redemptions: d.redemptions ?? [],
+  };
+}
+
+// Accepts schemaVersion 1, 2 or 3. Returns upgraded v3 data; throws BackupValidationError; never touches the database.
 export function validateBackup(b) {
   const bad = (m) => { throw new BackupValidationError(m); };
-  const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
   const str = (v) => typeof v === 'string' && v.length > 0;
   const num = (v) => Number.isFinite(v) && v >= 0;
+  const int = (v) => Number.isInteger(v);
+  const date = (v) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
   if (!isObj(b) || b.app !== 'life-rpg') bad('This file is not a Life RPG backup.');
-  if (b.schemaVersion !== DB_VERSION) bad(`Unsupported schemaVersion: ${b.schemaVersion}.`);
+  if (![1, 2, 3].includes(b.schemaVersion)) bad(`Unsupported schemaVersion: ${b.schemaVersion}.`);
   if (b.exportFormatVersion !== EXPORT_FORMAT_VERSION) bad(`Unsupported exportFormatVersion: ${b.exportFormatVersion}.`);
-  const d = b.data;
-  if (!isObj(d)) bad('Backup has no data section.');
-  for (const s of STORES) if (!Array.isArray(d[s])) bad(`Backup is missing the "${s}" list.`);
+  if (!isObj(b.data)) bad('Backup has no data section.');
+  const required = b.schemaVersion >= 3 ? STORES : STORES.slice(0, 4);
+  for (const s of required) if (!Array.isArray(b.data[s])) bad(`Backup is missing the "${s}" list.`);
+  for (const s of STORES) if (b.data[s] !== undefined && !Array.isArray(b.data[s])) bad(`"${s}" must be a list.`);
+  const d = upgradeBackup(b);
 
   if (d.profile.length !== 1) bad('Backup must contain exactly one profile.');
   const p = d.profile[0];
-  if (!isObj(p) || p.id !== 'player_1' || !str(p.displayName) || !num(p.totalXp) || !MODES.includes(p.difficultyMode)) bad('Profile data is invalid.');
+  if (!isObj(p) || p.id !== 'player_1' || !str(p.displayName) || !num(p.totalXp) || !MODES.includes(p.difficultyMode)
+    || !Number.isInteger(p.weeklyTargetDays) || p.weeklyTargetDays < 1 || p.weeklyTargetDays > 7) bad('Profile data is invalid.');
 
   const attrIds = new Set();
   for (const a of d.attributes) {
@@ -155,16 +203,53 @@ export function validateBackup(b) {
   const questIds = new Set();
   for (const q of d.quests) {
     if (!isObj(q) || !str(q.id) || questIds.has(q.id) || !str(q.title) || !QUEST_TYPES[q.type] || !EFFORT_TIERS[q.effortTier]
-      || q.xpReward !== EFFORT_TIERS[q.effortTier].xp || !attrIds.has(q.attributeId) || !['active', 'completed'].includes(q.status) || !str(q.createdAt)) bad('Quest data is invalid.');
+      || q.xpReward !== EFFORT_TIERS[q.effortTier].xp || !attrIds.has(q.attributeId)
+      || !['active', 'paused', 'completed', 'archived'].includes(q.status) || !str(q.createdAt)
+      || typeof q.isGoldEligible !== 'boolean' || !str(q.updatedAt)) bad('Quest data is invalid.');
     questIds.add(q.id);
   }
-  const keys = new Set(), ids = new Set();
+
+  // Completions may outlive their quest (permanent deletion keeps history), so questId need not exist in quests.
+  const keys = new Set(), compIds = new Set();
   for (const c of d.completions) {
-    if (!isObj(c) || !str(c.id) || ids.has(c.id) || !questIds.has(c.questId) || !str(c.periodKey) || !str(c.questTitleSnapshot)
-      || !attrIds.has(c.attributeId) || !num(c.xpAwarded) || Number.isNaN(Date.parse(c.completedAt))) bad('Completion history is invalid.');
+    if (!isObj(c) || !str(c.id) || compIds.has(c.id) || !str(c.questId) || !str(c.periodKey) || !str(c.questTitleSnapshot)
+      || !attrIds.has(c.attributeId) || !num(c.xpAwarded) || !date(c.completedAt)
+      || (c.goldAwarded !== undefined && !num(c.goldAwarded))) bad('Completion history is invalid.');
     const k = `${c.questId}|${c.periodKey}`;
     if (keys.has(k)) bad('Completion history contains a duplicate.');
-    ids.add(c.id); keys.add(k);
+    compIds.add(c.id); keys.add(k);
+  }
+
+  const rewardIds = new Set();
+  for (const r of d.rewards) {
+    if (!isObj(r) || !str(r.id) || rewardIds.has(r.id) || !str(r.title) || (r.description !== undefined && typeof r.description !== 'string')
+      || !int(r.goldCost) || r.goldCost < 1 || r.goldCost > 100000 || typeof r.isActive !== 'boolean' || !date(r.createdAt) || !date(r.updatedAt)) bad('Reward data is invalid.');
+    rewardIds.add(r.id);
+  }
+  const redIds = new Set();
+  for (const r of d.redemptions) {
+    if (!isObj(r) || !str(r.id) || redIds.has(r.id) || !rewardIds.has(r.rewardId) || !str(r.rewardTitleSnapshot)
+      || !int(r.goldSpent) || r.goldSpent < 1 || !['redeemed', 'refunded'].includes(r.status) || !date(r.redeemedAt)) bad('Redemption data is invalid.');
+    redIds.add(r.id);
+  }
+
+  const txKeys = new Set(), ledgerIds = new Set();
+  for (const l of d.currencyLedger) {
+    if (!isObj(l) || !str(l.id) || ledgerIds.has(l.id) || !int(l.amount) || l.amount === 0 || !str(l.reason) || !date(l.createdAt)
+      || !str(l.transactionKey) || txKeys.has(l.transactionKey)) bad('Gold ledger data is invalid.');
+    if (l.relatedCompletionId != null && !compIds.has(l.relatedCompletionId)) bad('A ledger entry points to a missing completion.');
+    if (l.relatedRedemptionId != null && !redIds.has(l.relatedRedemptionId)) bad('A ledger entry points to a missing redemption.');
+    ledgerIds.add(l.id); txKeys.add(l.transactionKey);
+  }
+  let balance = 0; // replay in time order (credits first on ties): the balance may never dip below zero
+  for (const l of [...d.currencyLedger].sort((x, y) => Date.parse(x.createdAt) - Date.parse(y.createdAt) || y.amount - x.amount)) {
+    balance += l.amount;
+    if (balance < 0) bad('Gold ledger would produce a negative balance.');
+  }
+  for (const r of d.redemptions) {
+    const rows = d.currencyLedger.filter((l) => l.relatedRedemptionId === r.id);
+    if (!rows.some((l) => l.amount === -r.goldSpent)) bad(`Redemption "${r.rewardTitleSnapshot}" has no matching Gold debit.`);
+    if (r.status === 'refunded' && !rows.some((l) => l.amount === r.goldSpent)) bad(`Refunded redemption "${r.rewardTitleSnapshot}" has no matching refund credit.`);
   }
   return d;
 }
