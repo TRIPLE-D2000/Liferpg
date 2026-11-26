@@ -1,5 +1,5 @@
 // Zero-dependency test runner. Serve the project over http (not file://) and open tests/test.html.
-import { EFFORT_TIERS, xpForTier, xpForLevel, levelFromXp, localDayKey, localWeekKey, periodKeyFor, prepareBoard, weekDays, weeklyConsistency } from '../js/gameLogic.js';
+import { EFFORT_TIERS, xpForTier, xpForLevel, levelFromXp, localDayKey, localWeekKey, periodKeyFor, prepareBoard, weekDays, weeklyConsistency, GOLD_BY_TIER, goldForTier, goldAwardFor, goldBalance } from '../js/gameLogic.js';
 import { openDatabase, getState, createQuest, completeQuest, updateQuest, changeQuestStatus, deleteQuest, setWeeklyTarget, setDifficultyMode, exportData, importData, restoreInTransaction, DuplicateCompletionError, BackupValidationError } from '../js/db.js';
 
 const tests = [];
@@ -437,11 +437,6 @@ test('invalid lifecycle transitions are rejected', () => withDb(async (db) => {
 test('permanent delete removes only the quest; history, XP and ledger rows survive', () => withDb(async (db) => {
   const q = await quest(db, { title: 'Doomed', type: 'daily', effortTier: 'major' });
   const c = await completeQuest(db, q.id, at(2026, 11, 26));
-  await new Promise((res, rej) => { // a ledger row that references the completion
-    const tx = db.transaction('currencyLedger', 'readwrite');
-    tx.objectStore('currencyLedger').add({ id: 'l1', amount: 50, reason: 'Quest completed', relatedCompletionId: c.id, relatedRedemptionId: null, createdAt: T, transactionKey: 'completion:' + c.id });
-    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
-  });
   const archivedOne = await quest(db, { title: 'Other' });
   await changeQuestStatus(db, archivedOne.id, 'archive');
   await deleteQuest(db, q.id);
@@ -466,6 +461,135 @@ test('a deleted quest stays deleted after reopening, and its history exports and
     eq((await getState(db)).completions[0].questTitleSnapshot, 'Gone');
   } finally { db.close(); indexedDB.deleteDatabase(name); }
 });
+
+// ---- Phase 3: Gold engine
+const bal = async (db) => goldBalance((await getState(db)).currencyLedger);
+const rawLedgerAdd = (db, row) => new Promise((res, rej) => {
+  const tx = db.transaction('currencyLedger', 'readwrite');
+  tx.objectStore('currencyLedger').add(row);
+  tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+});
+
+test('Gold per effort tier is 5 / 10 / 25 / 50', () => {
+  eq(['small', 'standard', 'meaningful', 'major'].map(goldForTier), [5, 10, 25, 50]);
+  eq(GOLD_BY_TIER, { small: 5, standard: 10, meaningful: 25, major: 50 });
+  for (const t of Object.keys(EFFORT_TIERS)) eq(goldForTier(t), xpForTier(t), 'matches XP');
+});
+test('goldAwardFor: eligible only, never in Rest mode', () => {
+  const q = (o = {}) => ({ effortTier: 'meaningful', isGoldEligible: true, ...o });
+  eq([goldAwardFor(q(), 'normal'), goldAwardFor(q(), 'gentle')], [25, 25]);
+  eq([goldAwardFor(q({ isGoldEligible: false }), 'normal'), goldAwardFor(q(), 'rest')], [0, 0]);
+});
+test('completion writes XP, completion and Gold credit together for every tier', () => withDb(async (db) => {
+  for (const [tier, gold] of [['small', 5], ['standard', 10], ['meaningful', 25], ['major', 50]]) {
+    const q = await quest(db, { type: 'side', effortTier: tier, title: tier });
+    const c = await completeQuest(db, q.id);
+    eq([c.xpAwarded, c.goldAwarded, c.effortTier], [gold, gold, tier]);
+  }
+  const s = await getState(db);
+  eq([s.profile.totalXp, goldBalance(s.currencyLedger), s.currencyLedger.length], [90, 90, 4]);
+  for (const l of s.currencyLedger) ok(s.completions.some((c) => c.id === l.relatedCompletionId && c.goldAwarded === l.amount), 'every credit has its completion');
+}));
+test('Gold-ineligible quests award zero Gold but full XP', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'main', effortTier: 'major', isGoldEligible: false });
+  const c = await completeQuest(db, q.id);
+  const s = await getState(db);
+  eq([c.xpAwarded, c.goldAwarded, s.profile.totalXp, s.currencyLedger.length, goldBalance(s.currencyLedger)], [50, 0, 50, 0, 0]);
+}));
+test('Rest mode awards no Gold, XP continues, and leaving Rest changes nothing retroactively', () => withDb(async (db) => {
+  await setDifficultyMode(db, 'rest');
+  const q = await quest(db, { type: 'daily', effortTier: 'standard' });
+  const c = await completeQuest(db, q.id, at(2026, 11, 26));
+  eq([c.xpAwarded, c.goldAwarded], [10, 0]);
+  await setDifficultyMode(db, 'normal');
+  eq([(await getState(db)).profile.totalXp, await bal(db)], [10, 0]);
+  eq((await completeQuest(db, q.id, at(2026, 11, 27))).goldAwarded, 10);
+  eq(await bal(db), 10);
+}));
+test('balance is derived from the ledger and the profile has no balance field', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'main', effortTier: 'standard' });
+  await completeQuest(db, q.id);
+  await rawLedgerAdd(db, { id: 'x1', amount: 7, reason: 'test credit', relatedCompletionId: null, relatedRedemptionId: null, createdAt: T, transactionKey: 'test:1' });
+  eq(await bal(db), 17);
+  const p = (await getState(db)).profile;
+  ok(!Object.keys(p).some((k) => /gold|balance/i.test(k)), 'no stored balance');
+}));
+test('double-click: two simultaneous completions mint Gold once', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'daily', effortTier: 'meaningful' });
+  const results = await Promise.allSettled([completeQuest(db, q.id, at(2026, 11, 26)), completeQuest(db, q.id, at(2026, 11, 26)), completeQuest(db, q.id, at(2026, 11, 26))]);
+  eq(results.filter((r) => r.status === 'fulfilled').length, 1);
+  ok(results.filter((r) => r.status === 'rejected').every((r) => r.reason.name === 'DuplicateCompletionError'), 'others rejected as duplicates');
+  const s = await getState(db);
+  eq([s.completions.length, s.currencyLedger.length, goldBalance(s.currencyLedger), s.profile.totalXp], [1, 1, 25, 25]);
+}));
+test('sequential repeat request cannot mint duplicate Gold', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'weekly', effortTier: 'major' });
+  await completeQuest(db, q.id, at(2026, 11, 24));
+  for (let i = 0; i < 3; i++) await rejects(completeQuest(db, q.id, at(2026, 11, 28)), 'DuplicateCompletionError');
+  eq(await bal(db), 50);
+}));
+test('duplicate ledger key rolls back the whole completion (no completion without its Gold)', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'main', effortTier: 'major' });
+  await rawLedgerAdd(db, { id: 'pre', amount: 1, reason: 'collision', relatedCompletionId: null, relatedRedemptionId: null, createdAt: T, transactionKey: `completion:${q.id}:once` });
+  await rejects(completeQuest(db, q.id), 'DuplicateCompletionError');
+  const s = await getState(db);
+  eq([s.completions.length, s.profile.totalXp, s.attributes.every((a) => a.totalXp === 0), s.quests[0].status, s.currencyLedger.length], [0, 0, true, 'active', 1]);
+}));
+test('failed completions never leave Gold behind', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'main' });
+  await changeQuestStatus(db, q.id, 'pause');
+  await rejects(completeQuest(db, q.id));
+  await rejects(completeQuest(db, 'missing'));
+  eq([(await getState(db)).currencyLedger.length, (await getState(db)).completions.length], [0, 0]);
+}));
+test('XP is independent of Gold eligibility', () => withDb(async (db) => {
+  const a = await quest(db, { type: 'side', title: 'A', effortTier: 'standard', isGoldEligible: true });
+  const b = await quest(db, { type: 'side', title: 'B', effortTier: 'standard', isGoldEligible: false });
+  const ca = await completeQuest(db, a.id), cb = await completeQuest(db, b.id);
+  eq([ca.xpAwarded, cb.xpAwarded, ca.goldAwarded, cb.goldAwarded], [10, 10, 10, 0]);
+}));
+test('editing Gold eligibility affects future completions only', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'daily', effortTier: 'standard' });
+  await completeQuest(db, q.id, at(2026, 11, 26));
+  await updateQuest(db, q.id, { isGoldEligible: false });
+  const next = await completeQuest(db, q.id, at(2026, 11, 27));
+  const s = await getState(db);
+  eq([next.goldAwarded, next.xpAwarded, await bal(db)], [0, 10, 10]);
+  eq(s.completions.map((c) => c.goldAwarded).sort(), [0, 10]);
+  await updateQuest(db, q.id, { isGoldEligible: true });
+  eq((await getState(db)).completions.find((c) => c.periodKey === '2026-11-26').goldAwarded, 10, 'history untouched');
+}));
+test('quest management never creates Gold', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'daily' });
+  await updateQuest(db, q.id, { title: 'Renamed', effortTier: 'major' });
+  for (const a of ['pause', 'resume', 'archive', 'restore']) await changeQuestStatus(db, q.id, a);
+  await deleteQuest(db, q.id);
+  eq([(await getState(db)).currencyLedger.length, await bal(db)], [0, 0]);
+}));
+test('deleting a quest keeps its Gold credit and completion reference', () => withDb(async (db) => {
+  const q = await quest(db, { title: 'Temp', type: 'main', effortTier: 'meaningful' });
+  const c = await completeQuest(db, q.id);
+  await deleteQuest(db, q.id);
+  const s = await getState(db);
+  eq([s.quests.length, goldBalance(s.currencyLedger), s.currencyLedger[0].relatedCompletionId, s.completions[0].questTitleSnapshot], [0, 25, c.id, 'Temp']);
+}));
+test('exported Gold history restores the exact balance; a completion without its credit is rejected', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'daily', effortTier: 'major' });
+  await completeQuest(db, q.id, at(2026, 11, 26));
+  const text = JSON.stringify(await exportData(db));
+  const q2 = await quest(db, { type: 'main' }); await completeQuest(db, q2.id);
+  eq(await bal(db), 60);
+  await importData(db, text);
+  eq(await bal(db), 50);
+  const tampered = JSON.parse(text); tampered.data.currencyLedger = [];
+  await rejects(importData(db, JSON.stringify(tampered)), 'BackupValidationError');
+  eq(await bal(db), 50);
+}));
+test('migrated history gets no retroactive Gold', () => withLegacy(1, {}, {}, async (db) => {
+  eq(await bal(db), 0);
+  const c = await completeQuest(db, 'q1', at(2026, 11, 26));
+  eq([c.goldAwarded, await bal(db)], [10, 10]);
+}));
 
 // ---- Runner
 const list = document.getElementById('results');
