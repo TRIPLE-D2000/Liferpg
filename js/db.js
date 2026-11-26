@@ -1,5 +1,5 @@
 // IndexedDB wrapper: schema, seeding, atomic completion, backup/restore.
-import { EFFORT_TIERS, QUEST_TYPES, MODES, DEFAULT_ATTRIBUTES, RECURRING, periodKeyFor, xpForTier, goldAwardFor } from './gameLogic.js';
+import { EFFORT_TIERS, QUEST_TYPES, MODES, DEFAULT_ATTRIBUTES, RECURRING, periodKeyFor, xpForTier, goldAwardFor, goldBalance, validateReward } from './gameLogic.js';
 
 export const DB_NAME = 'life_rpg';
 export const DB_VERSION = 3;
@@ -8,6 +8,15 @@ const STORES = ['profile', 'attributes', 'quests', 'completions', 'currencyLedge
 
 export class DuplicateCompletionError extends Error {
   constructor() { super('Already completed for this period.'); this.name = 'DuplicateCompletionError'; }
+}
+export class InsufficientGoldError extends Error {
+  constructor(have, need) { super(`Not enough Gold: you have ${have}, this costs ${need}.`); this.name = 'InsufficientGoldError'; }
+}
+export class DuplicateRedemptionError extends Error {
+  constructor() { super('This redemption was already processed.'); this.name = 'DuplicateRedemptionError'; }
+}
+export class AlreadyRefundedError extends Error {
+  constructor() { super('This redemption has already been refunded.'); this.name = 'AlreadyRefundedError'; }
 }
 export class BackupValidationError extends Error {
   constructor(msg) { super(msg); this.name = 'BackupValidationError'; }
@@ -207,6 +216,94 @@ export function completeQuest(db, questId, now = new Date()) {
   });
 }
 
+// ---- Rewards, redemption and refunds -------------------------------------------
+// Every money movement runs in ONE transaction and re-checks the rules inside it (the UI balance is never trusted).
+// Overlapping read-write transactions are serialized by IndexedDB, so two simultaneous redemptions cannot both spend the same Gold.
+async function inTx(db, stores, fn) {
+  const tx = db.transaction(stores, 'readwrite');
+  const done = txDone(tx);
+  done.catch(() => {}); // surfaced through `await done` below; avoids an unhandled rejection if we abort early
+  try {
+    const result = await fn(tx);
+    await done;
+    return result;
+  } catch (e) {
+    try { tx.abort(); } catch { /* already finished */ }
+    throw e;
+  }
+}
+
+export async function createReward(db, input) {
+  const clean = validateReward(input);
+  const now = new Date().toISOString();
+  const reward = { id: newId(), ...clean, isActive: true, createdAt: now, updatedAt: now };
+  await inTx(db, 'rewards', (tx) => { tx.objectStore('rewards').add(reward); });
+  return reward;
+}
+
+// Editing changes the shop listing only. Past redemptions keep their own title and amount snapshots.
+export function updateReward(db, id, fields) {
+  return inTx(db, 'rewards', async (tx) => {
+    const r = await wrap(tx.objectStore('rewards').get(id));
+    if (!r) throw new Error('Reward not found.');
+    const clean = validateReward({ title: fields.title ?? r.title, description: fields.description ?? r.description, goldCost: fields.goldCost ?? r.goldCost });
+    const next = { ...r, ...clean, updatedAt: new Date().toISOString() };
+    tx.objectStore('rewards').put(next);
+    return next;
+  });
+}
+
+// Archive = isActive false; restore = isActive true. Rewards are never deleted (redemptions reference them).
+export function setRewardActive(db, id, isActive) {
+  return inTx(db, 'rewards', async (tx) => {
+    const r = await wrap(tx.objectStore('rewards').get(id));
+    if (!r) throw new Error('Reward not found.');
+    tx.objectStore('rewards').put({ ...r, isActive: !!isActive, updatedAt: new Date().toISOString() });
+  });
+}
+
+const mapConstraint = (e, Err) => (e && e.name === 'ConstraintError' ? new Err() : e);
+
+// requestId makes a retry/double-tap idempotent: the same id can only ever be processed once.
+export async function redeemReward(db, rewardId, { now = new Date(), requestId } = {}) {
+  try {
+    return await inTx(db, ['rewards', 'redemptions', 'currencyLedger'], async (tx) => {
+      const reward = await wrap(tx.objectStore('rewards').get(rewardId));
+      if (!reward) throw new Error('Reward not found.');
+      if (!reward.isActive) throw new Error('This reward is archived. Restore it to redeem.');
+      const balance = goldBalance(await wrap(tx.objectStore('currencyLedger').getAll()));
+      if (balance < reward.goldCost) throw new InsufficientGoldError(balance, reward.goldCost);
+      const at = now.toISOString();
+      const redemption = { id: requestId || newId(), rewardId, rewardTitleSnapshot: reward.title, goldSpent: reward.goldCost, status: 'redeemed', redeemedAt: at };
+      tx.objectStore('redemptions').add(redemption);
+      tx.objectStore('currencyLedger').add({
+        id: newId(), amount: -reward.goldCost, reason: `Redeemed: ${reward.title}`, relatedCompletionId: null,
+        relatedRedemptionId: redemption.id, createdAt: at, transactionKey: `redeem:${redemption.id}`,
+      });
+      return redemption;
+    });
+  } catch (e) { throw mapConstraint(e, DuplicateRedemptionError); }
+}
+
+// Refund = a NEW positive ledger entry + status change. The original debit is never edited or deleted.
+export async function refundRedemption(db, redemptionId, now = new Date()) {
+  try {
+    return await inTx(db, ['redemptions', 'currencyLedger'], async (tx) => {
+      const r = await wrap(tx.objectStore('redemptions').get(redemptionId));
+      if (!r) throw new Error('Redemption not found.');
+      if (r.status !== 'redeemed') throw new AlreadyRefundedError();
+      const at = now.toISOString();
+      tx.objectStore('currencyLedger').add({
+        id: newId(), amount: r.goldSpent, reason: `Refund: ${r.rewardTitleSnapshot}`, relatedCompletionId: null,
+        relatedRedemptionId: r.id, createdAt: at, transactionKey: `refund:${r.id}`,
+      });
+      const next = { ...r, status: 'refunded', refundedAt: at };
+      tx.objectStore('redemptions').put(next);
+      return next;
+    });
+  } catch (e) { throw mapConstraint(e, AlreadyRefundedError); }
+}
+
 export async function setDifficultyMode(db, mode) {
   if (!MODES.includes(mode)) throw new Error('Unknown mode.');
   const tx = db.transaction('profile', 'readwrite');
@@ -297,7 +394,8 @@ export function validateBackup(b) {
   const redIds = new Set();
   for (const r of d.redemptions) {
     if (!isObj(r) || !str(r.id) || redIds.has(r.id) || !rewardIds.has(r.rewardId) || !str(r.rewardTitleSnapshot)
-      || !int(r.goldSpent) || r.goldSpent < 1 || !['redeemed', 'refunded'].includes(r.status) || !date(r.redeemedAt)) bad('Redemption data is invalid.');
+      || !int(r.goldSpent) || r.goldSpent < 1 || !['redeemed', 'refunded'].includes(r.status) || !date(r.redeemedAt)
+      || (r.refundedAt !== undefined && !date(r.refundedAt))) bad('Redemption data is invalid.');
     redIds.add(r.id);
   }
 
