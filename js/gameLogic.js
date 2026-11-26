@@ -59,3 +59,39 @@ export function periodKeyFor(type, date = new Date()) {
 export function formatLocal(iso) {
   return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
 }
+
+// ---- Modes (Phase 2) -------------------------------------------------------
+export const EFFORT_ORDER = ['small', 'standard', 'meaningful', 'major'];
+
+// Pure view logic: which active quests to show, in what order, and which are collapsed.
+// Rest mode hides the board unless showAnyway. Nothing here ever blocks saving progress.
+export function prepareBoard(quests, mode, { filter = 'all', showAnyway = false, expanded = new Set() } = {}) {
+  const typeOrder = Object.keys(QUEST_TYPES);
+  const base = (a, b) => typeOrder.indexOf(a.type) - typeOrder.indexOf(b.type) || a.createdAt.localeCompare(b.createdAt);
+  const list = quests.filter((q) => q.status === 'active' && (filter === 'all' || q.type === filter));
+  if (mode === 'gentle') list.sort((a, b) => EFFORT_ORDER.indexOf(a.effortTier) - EFFORT_ORDER.indexOf(b.effortTier) || base(a, b));
+  else list.sort(base);
+  if (mode === 'rest' && !showAnyway) return { resting: true, items: [] };
+  const heavy = (q) => q.effortTier === 'meaningful' || q.effortTier === 'major';
+  return { resting: mode === 'rest', items: list.map((q) => ({ quest: q, collapsed: mode === 'gentle' && heavy(q) && !expanded.has(q.id) })) };
+}
+
+// ---- Weekly consistency (Phase 2) -----------------------------------------
+// The 7 local day keys of the week containing `now` (Monday start by default).
+export function weekDays(now = new Date(), weekStartsOn = 1) {
+  const off = (now.getDay() - weekStartsOn + 7) % 7;
+  return Array.from({ length: 7 }, (_, i) => localDayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - off + i)));
+}
+
+// Derived purely from completion history. Unique local days with >= 1 completion. Never penalizes.
+export function weeklyConsistency(completions, now = new Date(), target = 4, weekStartsOn = 1) {
+  const active = new Set(completions.map((c) => localDayKey(new Date(c.completedAt))));
+  const today = localDayKey(now);
+  const days = weekDays(now, weekStartsOn).map((key) => ({ key, active: active.has(key), today: key === today }));
+  const count = days.filter((d) => d.active).length;
+  const reached = count >= target;
+  const message = reached ? 'Target reached. Anything more is a bonus.'
+    : count === 0 ? 'A fresh week. One quest is enough to get started.'
+    : 'Good progress. Every active day counts.';
+  return { count, target, days, reached, message, pct: Math.min(100, Math.round((100 * count) / target)) };
+}
