@@ -109,3 +109,33 @@ export function goldAwardFor(quest, mode) {
 }
 // The balance is never stored: it is always the sum of the immutable ledger.
 export const goldBalance = (ledger) => ledger.reduce((n, l) => n + l.amount, 0);
+
+// ---- Rewards (Phase 3) -------------------------------------------------------
+export const MAX_REWARD_COST = 100000;
+
+// Returns trimmed, valid reward fields or throws a user-readable Error.
+export function validateReward({ title, description = '', goldCost }) {
+  const t = typeof title === 'string' ? title.trim() : '';
+  if (!t) throw new Error('Reward title is required.');
+  if (t.length > 80) throw new Error('Reward title must be 80 characters or fewer.');
+  const d = typeof description === 'string' ? description.trim() : '';
+  if (d.length > 300) throw new Error('Description must be 300 characters or fewer.');
+  if (typeof goldCost !== 'number' || !Number.isInteger(goldCost)) throw new Error('Gold cost must be a whole number.');
+  if (goldCost < 1) throw new Error('Gold cost must be at least 1.');
+  if (goldCost > MAX_REWARD_COST) throw new Error(`Gold cost cannot be more than ${MAX_REWARD_COST}.`);
+  return { title: t, description: d, goldCost };
+}
+
+// One chronological list of every Gold movement, newest first. Titles come from snapshots,
+// so history reads correctly even after a quest is deleted or a reward is renamed.
+export function buildHistory({ currencyLedger, completions, redemptions }) {
+  const comp = new Map(completions.map((c) => [c.id, c]));
+  const red = new Map(redemptions.map((r) => [r.id, r]));
+  return [...currencyLedger].map((l) => {
+    const c = l.relatedCompletionId && comp.get(l.relatedCompletionId);
+    const r = l.relatedRedemptionId && red.get(l.relatedRedemptionId);
+    if (c) return { id: l.id, kind: 'earned', amount: l.amount, title: c.questTitleSnapshot, createdAt: l.createdAt };
+    if (r) return { id: l.id, kind: l.amount < 0 ? 'spent' : 'refund', amount: l.amount, title: r.rewardTitleSnapshot, createdAt: l.createdAt, redemptionId: r.id, status: r.status };
+    return { id: l.id, kind: 'adjustment', amount: l.amount, title: l.reason, createdAt: l.createdAt };
+  }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.amount - a.amount);
+}
