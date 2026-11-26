@@ -1,6 +1,6 @@
 // Zero-dependency test runner. Serve the project over http (not file://) and open tests/test.html.
-import { EFFORT_TIERS, xpForTier, xpForLevel, levelFromXp, localDayKey, localWeekKey, periodKeyFor, prepareBoard, weekDays, weeklyConsistency, GOLD_BY_TIER, goldForTier, goldAwardFor, goldBalance } from '../js/gameLogic.js';
-import { openDatabase, getState, createQuest, completeQuest, updateQuest, changeQuestStatus, deleteQuest, setWeeklyTarget, setDifficultyMode, exportData, importData, restoreInTransaction, DuplicateCompletionError, BackupValidationError } from '../js/db.js';
+import { EFFORT_TIERS, xpForTier, xpForLevel, levelFromXp, localDayKey, localWeekKey, periodKeyFor, prepareBoard, weekDays, weeklyConsistency, GOLD_BY_TIER, goldForTier, goldAwardFor, goldBalance, validateReward, buildHistory } from '../js/gameLogic.js';
+import { openDatabase, getState, createQuest, completeQuest, updateQuest, changeQuestStatus, deleteQuest, setWeeklyTarget, setDifficultyMode, createReward, updateReward, setRewardActive, redeemReward, refundRedemption, InsufficientGoldError, DuplicateRedemptionError, AlreadyRefundedError, exportData, importData, restoreInTransaction, DuplicateCompletionError, BackupValidationError } from '../js/db.js';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -589,6 +589,177 @@ test('migrated history gets no retroactive Gold', () => withLegacy(1, {}, {}, as
   eq(await bal(db), 0);
   const c = await completeQuest(db, 'q1', at(2026, 11, 26));
   eq([c.goldAwarded, await bal(db)], [10, 10]);
+}));
+
+// ---- Phase 3: rewards, redemption, refunds
+let earnN = 0;
+const earn = async (db, tier = 'major') => completeQuest(db, (await quest(db, { type: 'side', effortTier: tier, title: 'earn' + earnN++ })).id);
+const reward = (db, o = {}) => createReward(db, { title: 'Movie night', description: 'Popcorn included', goldCost: 30, ...o });
+const R = async (db) => (await getState(db));
+
+test('reward validation: title, whole positive cost, sane maximum', () => {
+  eq(validateReward({ title: '  Coffee  ', description: '  nice ', goldCost: 20 }), { title: 'Coffee', description: 'nice', goldCost: 20 });
+  eq(validateReward({ title: 'x', goldCost: 1 }).description, '');
+  for (const bad of [{ title: '', goldCost: 5 }, { title: '   ', goldCost: 5 }, { title: 'x', goldCost: 0 }, { title: 'x', goldCost: -3 },
+    { title: 'x', goldCost: 2.5 }, { title: 'x', goldCost: 100001 }, { title: 'x', goldCost: NaN }, { title: 'x', goldCost: '10' }, { title: 'x' },
+    { title: 'x'.repeat(81), goldCost: 5 }, { title: 'x', goldCost: 5, description: 'y'.repeat(301) }]) {
+    let threw = false; try { validateReward(bad); } catch { threw = true; }
+    ok(threw, 'should reject ' + JSON.stringify(bad).slice(0, 60));
+  }
+  eq(validateReward({ title: 'x', goldCost: 100000 }).goldCost, 100000);
+});
+test('creating a reward stores a trimmed active reward; invalid input stores nothing', () => withDb(async (db) => {
+  const r = await reward(db, { title: '  Pizza  ', goldCost: 40 });
+  eq([r.title, r.goldCost, r.isActive, r.description], ['Pizza', 40, true, 'Popcorn included']);
+  await rejects(reward(db, { goldCost: 0 })); await rejects(reward(db, { title: ' ' })); await rejects(reward(db, { goldCost: 1.5 }));
+  eq((await R(db)).rewards.length, 1);
+}));
+test('editing a reward validates input and keeps the id', () => withDb(async (db) => {
+  const r = await reward(db);
+  const e = await updateReward(db, r.id, { title: 'Cinema trip', goldCost: 45 });
+  eq([e.id, e.title, e.goldCost, e.description, e.isActive], [r.id, 'Cinema trip', 45, 'Popcorn included', true]);
+  await rejects(updateReward(db, r.id, { goldCost: -1 })); await rejects(updateReward(db, r.id, { title: '' })); await rejects(updateReward(db, 'nope', { title: 'x' }));
+  eq((await R(db)).rewards[0].goldCost, 45);
+}));
+test('redeeming debits Gold and records the redemption together', () => withDb(async (db) => {
+  await earn(db, 'major');
+  const r = await reward(db, { goldCost: 30 });
+  const red = await redeemReward(db, r.id, { now: at(2026, 11, 26) });
+  const s = await R(db);
+  eq([red.goldSpent, red.status, red.rewardTitleSnapshot, red.rewardId], [30, 'redeemed', 'Movie night', r.id]);
+  eq([goldBalance(s.currencyLedger), s.redemptions.length], [20, 1]);
+  const debit = s.currencyLedger.find((l) => l.amount < 0);
+  eq([debit.amount, debit.relatedRedemptionId, debit.transactionKey], [-30, red.id, 'redeem:' + red.id]);
+}));
+test('insufficient balance is rejected and nothing changes (no negative balance)', () => withDb(async (db) => {
+  await earn(db, 'standard'); // 10 Gold
+  const r = await reward(db, { goldCost: 30 });
+  await rejects(redeemReward(db, r.id), 'InsufficientGoldError');
+  const s = await R(db);
+  eq([goldBalance(s.currencyLedger), s.redemptions.length, s.currencyLedger.length], [10, 0, 1]);
+  const exact = await reward(db, { title: 'Exact', goldCost: 10 });
+  await redeemReward(db, exact.id);
+  eq(await bal(db), 0);
+  await rejects(redeemReward(db, exact.id), 'InsufficientGoldError');
+  eq(await bal(db), 0);
+}));
+test('concurrent redemptions cannot overspend', () => withDb(async (db) => {
+  await earn(db, 'major'); // 50 Gold, reward costs 30: only one of three can succeed
+  const r = await reward(db, { goldCost: 30 });
+  const res = await Promise.allSettled([redeemReward(db, r.id), redeemReward(db, r.id), redeemReward(db, r.id)]);
+  eq(res.filter((x) => x.status === 'fulfilled').length, 1);
+  ok(res.filter((x) => x.status === 'rejected').every((x) => x.reason.name === 'InsufficientGoldError'), 'others: insufficient');
+  const s = await R(db);
+  eq([goldBalance(s.currencyLedger), s.redemptions.length], [20, 1]);
+}));
+test('a repeated request id is processed once (idempotent)', () => withDb(async (db) => {
+  await earn(db, 'major'); await earn(db, 'major');
+  const r = await reward(db, { goldCost: 30 });
+  const res = await Promise.allSettled([redeemReward(db, r.id, { requestId: 'req-1' }), redeemReward(db, r.id, { requestId: 'req-1' })]);
+  eq(res.map((x) => x.status).sort(), ['fulfilled', 'rejected']);
+  eq(res.find((x) => x.status === 'rejected').reason.name, 'DuplicateRedemptionError');
+  await rejects(redeemReward(db, r.id, { requestId: 'req-1' }), 'DuplicateRedemptionError');
+  eq([await bal(db), (await R(db)).redemptions.length], [70, 1]);
+}));
+test('redemption rolls back completely if the debit cannot be written', () => withDb(async (db) => {
+  await earn(db, 'major');
+  const r = await reward(db, { goldCost: 30 });
+  await rawLedgerAdd(db, { id: 'blocker', amount: 1, reason: 'collision', relatedCompletionId: null, relatedRedemptionId: null, createdAt: T, transactionKey: 'redeem:req-x' });
+  await rejects(redeemReward(db, r.id, { requestId: 'req-x' }));
+  const s = await R(db);
+  eq([s.redemptions.length, goldBalance(s.currencyLedger), s.currencyLedger.length], [0, 51, 2]);
+}));
+test('archived rewards cannot be redeemed; restoring makes them redeemable again', () => withDb(async (db) => {
+  await earn(db, 'major');
+  const r = await reward(db, { goldCost: 20 });
+  await setRewardActive(db, r.id, false);
+  eq((await R(db)).rewards[0].isActive, false);
+  await rejects(redeemReward(db, r.id));
+  eq([await bal(db), (await R(db)).redemptions.length], [50, 0]);
+  await setRewardActive(db, r.id, true);
+  await redeemReward(db, r.id);
+  eq(await bal(db), 30);
+  await rejects(setRewardActive(db, 'nope', false));
+}));
+test('editing or archiving a reward never changes past redemptions', () => withDb(async (db) => {
+  await earn(db, 'major');
+  const r = await reward(db, { title: 'Movie night', goldCost: 30 });
+  const red = await redeemReward(db, r.id);
+  await updateReward(db, r.id, { title: 'Renamed', goldCost: 99 });
+  await setRewardActive(db, r.id, false);
+  const s = await R(db);
+  eq([s.redemptions[0].rewardTitleSnapshot, s.redemptions[0].goldSpent, s.currencyLedger.find((l) => l.amount < 0).amount], ['Movie night', 30, -30]);
+  eq(buildHistory(s).find((h) => h.kind === 'spent').title, 'Movie night');
+  eq(red.id, s.redemptions[0].id);
+}));
+test('refund adds a compensating credit, keeps the original debit and updates the status', () => withDb(async (db) => {
+  await completeQuest(db, (await quest(db, { type: 'side', effortTier: 'major' })).id, at(2026, 11, 25));
+  const r = await reward(db, { goldCost: 30 });
+  const red = await redeemReward(db, r.id, { now: at(2026, 11, 26, 10) });
+  const debitBefore = JSON.stringify((await R(db)).currencyLedger.find((l) => l.amount < 0));
+  const out = await refundRedemption(db, red.id, at(2026, 11, 26, 11));
+  const s = await R(db);
+  eq([out.status, s.redemptions[0].status, typeof s.redemptions[0].refundedAt], ['refunded', 'refunded', 'string']);
+  eq([s.currencyLedger.length, goldBalance(s.currencyLedger)], [3, 50]);
+  eq(JSON.stringify(s.currencyLedger.find((l) => l.amount < 0)), debitBefore, 'debit untouched');
+  const credit = s.currencyLedger.find((l) => l.relatedRedemptionId === red.id && l.amount > 0);
+  eq([credit.amount, credit.transactionKey], [30, 'refund:' + red.id]);
+  eq(buildHistory(s).map((h) => h.kind), ['refund', 'spent', 'earned']);
+}));
+test('a redemption can be refunded only once, even with simultaneous requests', () => withDb(async (db) => {
+  await earn(db, 'major');
+  const r = await reward(db, { goldCost: 30 });
+  const red = await redeemReward(db, r.id);
+  const res = await Promise.allSettled([refundRedemption(db, red.id), refundRedemption(db, red.id), refundRedemption(db, red.id)]);
+  eq(res.filter((x) => x.status === 'fulfilled').length, 1);
+  ok(res.filter((x) => x.status === 'rejected').every((x) => x.reason.name === 'AlreadyRefundedError'), 'duplicates rejected');
+  await rejects(refundRedemption(db, red.id), 'AlreadyRefundedError');
+  await rejects(refundRedemption(db, 'nope'));
+  eq([await bal(db), (await R(db)).currencyLedger.length], [50, 3]);
+}));
+test('refund is atomic: if the credit cannot be written the status stays redeemed', () => withDb(async (db) => {
+  await earn(db, 'major');
+  const r = await reward(db, { goldCost: 30 });
+  const red = await redeemReward(db, r.id);
+  await rawLedgerAdd(db, { id: 'blocker', amount: 1, reason: 'collision', relatedCompletionId: null, relatedRedemptionId: null, createdAt: T, transactionKey: 'refund:' + red.id });
+  await rejects(refundRedemption(db, red.id));
+  const s = await R(db);
+  eq([s.redemptions[0].status, 'refundedAt' in s.redemptions[0], goldBalance(s.currencyLedger)], ['redeemed', false, 21]);
+}));
+test('after a refund the Gold can be spent again', () => withDb(async (db) => {
+  await earn(db, 'major');
+  const r = await reward(db, { goldCost: 50 });
+  const a = await redeemReward(db, r.id);
+  await rejects(redeemReward(db, r.id), 'InsufficientGoldError');
+  await refundRedemption(db, a.id);
+  await redeemReward(db, r.id);
+  eq([await bal(db), (await R(db)).redemptions.map((x) => x.status).sort()], [0, ['redeemed', 'refunded']]);
+}));
+test('history lists earned, spent and refund rows newest first with snapshot titles', () => withDb(async (db) => {
+  const q = await quest(db, { title: 'Run', type: 'main', effortTier: 'major' });
+  await completeQuest(db, q.id, at(2026, 11, 20));
+  const r = await reward(db, { title: 'Treat', goldCost: 20 });
+  const red = await redeemReward(db, r.id, { now: at(2026, 11, 21) });
+  await refundRedemption(db, red.id, at(2026, 11, 22));
+  await deleteQuest(db, q.id);
+  const h = buildHistory(await R(db));
+  eq(h.map((x) => [x.kind, x.title, x.amount]), [['refund', 'Treat', 20], ['spent', 'Treat', -20], ['earned', 'Run', 50]]);
+}));
+test('backup of rewards, redemptions and refunds restores balances and statuses exactly', () => withDb(async (db) => {
+  await earn(db, 'major'); await earn(db, 'major');
+  const r = await reward(db, { goldCost: 30 });
+  const a = await redeemReward(db, r.id);
+  await redeemReward(db, r.id);
+  await refundRedemption(db, a.id);
+  const text = JSON.stringify(await exportData(db));
+  const want = await bal(db);
+  await earn(db, 'major');
+  await importData(db, text);
+  const s = await R(db);
+  eq([await bal(db), want, s.redemptions.map((x) => x.status).sort()], [want, 70, ['redeemed', 'refunded']]);
+  const bad = JSON.parse(text); bad.data.currencyLedger = bad.data.currencyLedger.filter((l) => l.amount > 0 || l.transactionKey.startsWith('refund:'));
+  await rejects(importData(db, JSON.stringify(bad)), 'BackupValidationError'); // redemption lost its debit
+  eq(await bal(db), want);
 }));
 
 // ---- Runner
