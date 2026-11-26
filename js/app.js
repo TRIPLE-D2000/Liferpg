@@ -1,9 +1,10 @@
 // State coordination and event wiring.
 import { openDatabase, getState, createQuest, updateQuest, changeQuestStatus, deleteQuest, completeQuest, setDifficultyMode, setWeeklyTarget, exportData, importData, DuplicateCompletionError } from './db.js';
-import { levelFromXp, localDayKey } from './gameLogic.js';
+import { levelFromXp, localDayKey, goldAwardFor } from './gameLogic.js';
 import * as ui from './ui.js';
 
 let db;
+const inFlight = new Set();
 const state = { screen: 'home', filter: 'all', showAnyway: false, expanded: new Set(), editId: null, data: null };
 const $ = (id) => document.getElementById(id);
 
@@ -26,13 +27,19 @@ function onExpand(id) { state.expanded.add(id); render(); }
 function onToggleRest() { state.showAnyway = !state.showAnyway; render(); }
 
 const onComplete = guard(async (q) => {
-  if (!(await ui.confirmDialog('Complete this quest?', `"${q.title}" will award ${q.xpReward} XP.`, 'Complete'))) return;
+  if (inFlight.has(q.id)) return; // the database also blocks duplicates; this just avoids a pointless second request
+  const gold = goldAwardFor(q, state.data.profile.difficultyMode);
+  if (!(await ui.confirmDialog('Complete this quest?', `"${q.title}" will award ${q.xpReward} XP${gold ? ` and ${gold} Gold` : ''}.`, 'Complete'))) return;
+  inFlight.add(q.id);
   const before = levelFromXp(state.data.profile.totalXp);
-  try { await completeQuest(db, q.id); }
+  let done;
+  try { done = await completeQuest(db, q.id); }
   catch (e) { if (e instanceof DuplicateCompletionError) { ui.toast('Already completed for this period.'); await refresh(); return; } throw e; }
+  finally { inFlight.delete(q.id); }
   await refresh();
   const after = levelFromXp(state.data.profile.totalXp);
-  ui.toast(after > before ? `Level up! You reached level ${after}.` : `+${q.xpReward} XP earned.`);
+  const earned = `+${done.xpAwarded} XP${done.goldAwarded ? `, +${done.goldAwarded} Gold` : ''}`;
+  ui.toast(after > before ? `Level up! You reached level ${after}. ${earned}` : `${earned} earned.`);
 });
 
 function openQuestDialog(q) {
