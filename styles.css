@@ -49,3 +49,23 @@ dialog input,dialog select{display:block;width:100%;margin-top:4px;padding:10px;
 #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:72px;background:#101722;border:1px solid var(--ok);padding:10px 16px;border-radius:10px;max-width:90vw;z-index:10}
 #toast.err{border-color:var(--danger)}
 @media (prefers-reduced-motion:reduce){.fill{transition:none}}
+
+.week{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:10px}
+.week b{display:block;margin-bottom:8px}
+.dots{display:flex;gap:6px;margin-bottom:8px}
+.dot{flex:1;text-align:center;font-size:.8rem;padding:4px 0;border-radius:8px;background:#101722;color:var(--muted)}
+.dot.on{background:var(--ok);color:#0e1f1c;font-weight:700}
+.dot.today{outline:1px solid var(--xp)}
+.rest{background:var(--panel);border:1px solid var(--ok);border-radius:14px;padding:16px;margin-bottom:10px}
+.rest p{margin:0 0 10px;font-size:1.05rem}
+.actions{display:flex;flex-wrap:wrap;gap:6px}
+button.sm{min-height:36px;padding:4px 12px;font-size:.88rem}
+button.danger{color:var(--danger);border-color:var(--danger)}
+.quest.soft{opacity:.8;border-style:dashed}
+.quest .actions{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+details.manage{margin-top:12px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px 12px}
+details.manage summary{cursor:pointer;min-height:40px;display:flex;align-items:center}
+.mrow{display:flex;flex-direction:column;gap:8px;padding:10px 0;border-top:1px solid var(--line)}
+label.check{display:flex;align-items:center;gap:10px;color:var(--text)}
+dialog label.check input{display:inline-block;width:auto;margin:0}
+select.inline{background:#101722;border:1px solid var(--line);border-radius:8px;padding:10px;min-height:44px}
