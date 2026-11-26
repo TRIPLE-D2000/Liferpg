@@ -85,7 +85,7 @@ export function renderHome(s, h) {
     el('h2', {}, 'Quest board'),
     el('div', { class: 'chips' }, [['all', 'All'], ...Object.entries(QUEST_TYPES)].map(([k, t]) =>
       el('button', { 'aria-pressed': String(h.filter === k), onclick: () => h.onFilter(k) }, t))),
-    quests.length ? quests.map(card) : el('p', { class: 'empty' }, 'No quests here yet. Create one to start earning XP.'),
+    ...(quests.length ? quests.map(card) : [el('p', { class: 'empty' }, 'No quests here yet. Create one to start earning XP.')]),
     el('button', { class: 'primary new', onclick: h.onNew }, 'New quest'));
 }
 
