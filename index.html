@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Life RPG</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top"><h1>Life RPG</h1></header>
+<main>
+  <section id="screen-home" class="screen"></section>
+  <section id="screen-profile" class="screen" hidden></section>
+</main>
+<nav class="tabs" aria-label="Screens">
+  <button data-screen="home" class="on">Home</button>
+  <button data-screen="profile">Profile</button>
+</nav>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+
+<dialog id="confirm-dialog">
+  <form method="dialog">
+    <h3></h3><p></p>
+    <div class="row">
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button value="ok" class="primary">OK</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="quest-dialog">
+  <form method="dialog" id="quest-form">
+    <h3>New quest</h3>
+    <label>Title <input name="title" required maxlength="80" autocomplete="off"></label>
+    <label>Finish condition (optional) <input name="finishCondition" maxlength="140" autocomplete="off"></label>
+    <label>Quest type <select name="type"></select></label>
+    <label>Linked attribute <select name="attributeId"></select></label>
+    <label>Effort tier <select name="effortTier"></select></label>
+    <div class="row">
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button value="ok" class="primary">Create quest</button>
+    </div>
+  </form>
+</dialog>
+
+<input type="file" id="import-file" accept="application/json,.json" hidden>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
