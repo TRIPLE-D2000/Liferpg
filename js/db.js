@@ -1,5 +1,5 @@
 // IndexedDB wrapper: schema, seeding, atomic completion, backup/restore.
-import { EFFORT_TIERS, QUEST_TYPES, MODES, DEFAULT_ATTRIBUTES, RECURRING, periodKeyFor, xpForTier } from './gameLogic.js';
+import { EFFORT_TIERS, QUEST_TYPES, MODES, DEFAULT_ATTRIBUTES, RECURRING, periodKeyFor, xpForTier, goldAwardFor } from './gameLogic.js';
 
 export const DB_NAME = 'life_rpg';
 export const DB_VERSION = 3;
@@ -158,42 +158,50 @@ export async function setWeeklyTarget(db, days) {
   await txDone(tx);
 }
 
-// One atomic transaction: completion row + player XP + attribute XP (+ close one-time quests).
-// The unique [questId, periodKey] index makes duplicates structurally impossible.
+// ONE atomic transaction: completion row + player XP + attribute XP + Gold ledger credit (+ close one-time quests).
+// Duplicates are blocked by database indexes, not buttons: the unique [questId, periodKey] completion index and the
+// unique ledger transactionKey. Any failure aborts everything, so there is never a completion without its Gold
+// (or Gold without its completion).
 export function completeQuest(db, questId, now = new Date()) {
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(['quests', 'completions', 'profile', 'attributes'], 'readwrite');
+    const tx = db.transaction(['quests', 'completions', 'profile', 'attributes', 'currencyLedger'], 'readwrite');
     let outcome, failure;
     tx.oncomplete = () => resolve(outcome);
     tx.onabort = () => reject(failure || tx.error || new Error('Transaction aborted'));
     const fail = (err) => { failure = err; try { tx.abort(); } catch { /* already finished */ } };
+    const failOn = (req) => { req.onerror = (ev) => { ev.preventDefault(); fail(ev.target.error && ev.target.error.name === 'ConstraintError' ? new DuplicateCompletionError() : ev.target.error); }; };
 
     tx.objectStore('quests').get(questId).onsuccess = (e) => {
       const quest = e.target.result;
       if (!quest) return fail(new Error('Quest not found.'));
       if (quest.status !== 'active') return fail(new Error('Quest is not active.'));
-      const completion = {
-        id: newId(), questId, periodKey: periodKeyFor(quest.type, now), questTitleSnapshot: quest.title,
-        attributeId: quest.attributeId, xpAwarded: quest.xpReward, completedAt: now.toISOString(),
-      };
-      const add = tx.objectStore('completions').add(completion);
-      add.onerror = (ev) => {
-        ev.preventDefault();
-        fail(ev.target.error && ev.target.error.name === 'ConstraintError' ? new DuplicateCompletionError() : ev.target.error);
-      };
-      add.onsuccess = () => {
-        tx.objectStore('profile').get('player_1').onsuccess = (pe) => {
-          const p = pe.target.result;
-          p.totalXp += completion.xpAwarded; p.updatedAt = completion.completedAt;
-          tx.objectStore('profile').put(p);
+      tx.objectStore('profile').get('player_1').onsuccess = (pe) => {
+        const profile = pe.target.result;
+        const gold = goldAwardFor(quest, profile.difficultyMode);
+        const at = now.toISOString(), periodKey = periodKeyFor(quest.type, now);
+        const completion = {
+          id: newId(), questId, periodKey, questTitleSnapshot: quest.title, attributeId: quest.attributeId,
+          effortTier: quest.effortTier, xpAwarded: quest.xpReward, goldAwarded: gold, completedAt: at,
         };
-        tx.objectStore('attributes').get(quest.attributeId).onsuccess = (ae) => {
-          const a = ae.target.result;
-          a.totalXp += completion.xpAwarded;
-          tx.objectStore('attributes').put(a);
+        const add = tx.objectStore('completions').add(completion);
+        failOn(add);
+        add.onsuccess = () => {
+          profile.totalXp += completion.xpAwarded; profile.updatedAt = at;
+          tx.objectStore('profile').put(profile);
+          tx.objectStore('attributes').get(quest.attributeId).onsuccess = (ae) => {
+            const a = ae.target.result;
+            a.totalXp += completion.xpAwarded;
+            tx.objectStore('attributes').put(a);
+          };
+          if (gold > 0) {
+            failOn(tx.objectStore('currencyLedger').add({
+              id: newId(), amount: gold, reason: `Quest completed: ${quest.title}`, relatedCompletionId: completion.id,
+              relatedRedemptionId: null, createdAt: at, transactionKey: `completion:${questId}:${periodKey}`,
+            }));
+          }
+          if (!RECURRING.has(quest.type)) tx.objectStore('quests').put({ ...quest, status: 'completed' });
+          outcome = completion;
         };
-        if (quest.type !== 'daily' && quest.type !== 'weekly') tx.objectStore('quests').put({ ...quest, status: 'completed' });
-        outcome = completion;
       };
     };
   });
@@ -274,6 +282,7 @@ export function validateBackup(b) {
     if (!isObj(c) || !str(c.id) || compIds.has(c.id) || !str(c.questId) || !str(c.periodKey) || !str(c.questTitleSnapshot)
       || !attrIds.has(c.attributeId) || !num(c.xpAwarded) || !date(c.completedAt)
       || (c.goldAwarded !== undefined && !num(c.goldAwarded))) bad('Completion history is invalid.');
+    if (c.effortTier !== undefined && !EFFORT_TIERS[c.effortTier]) bad('Completion history is invalid.');
     const k = `${c.questId}|${c.periodKey}`;
     if (keys.has(k)) bad('Completion history contains a duplicate.');
     compIds.add(c.id); keys.add(k);
@@ -304,6 +313,9 @@ export function validateBackup(b) {
   for (const l of [...d.currencyLedger].sort((x, y) => Date.parse(x.createdAt) - Date.parse(y.createdAt) || y.amount - x.amount)) {
     balance += l.amount;
     if (balance < 0) bad('Gold ledger would produce a negative balance.');
+  }
+  for (const c of d.completions) { // no completion may claim Gold that the ledger does not hold
+    if (c.goldAwarded > 0 && !d.currencyLedger.some((l) => l.relatedCompletionId === c.id && l.amount === c.goldAwarded)) bad('A completion is missing its Gold credit.');
   }
   for (const r of d.redemptions) {
     const rows = d.currencyLedger.filter((l) => l.relatedRedemptionId === r.id);
