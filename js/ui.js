@@ -1,5 +1,5 @@
 // DOM rendering only. Text is always inserted as text nodes (no innerHTML).
-import { EFFORT_TIERS, QUEST_TYPES, RECURRING, MODES, levelProgress, periodKeyFor, formatLocal } from './gameLogic.js';
+import { EFFORT_TIERS, QUEST_TYPES, RECURRING, MODES, levelProgress, periodKeyFor, formatLocal, prepareBoard, weeklyConsistency } from './gameLogic.js';
 
 const $ = (s) => document.querySelector(s);
 
@@ -51,42 +51,78 @@ export function setAttributeOptions(attributes) {
   $('#quest-form').attributeId.replaceChildren(...attributes.map((a) => el('option', { value: a.id }, a.name)));
 }
 
+const act = (label, fn, cls = '') => el('button', { class: ('sm ' + cls).trim(), onclick: fn }, label);
+const MODE_LABEL = (m) => m[0].toUpperCase() + m.slice(1);
+
 export function renderHome(s, h) {
   const root = $('#screen-home');
+  const mode = s.profile.difficultyMode;
   const lp = levelProgress(s.profile.totalXp);
   const attrName = Object.fromEntries(s.attributes.map((a) => [a.id, a.name]));
-  const order = Object.keys(QUEST_TYPES);
-  const quests = s.quests
-    .filter((q) => q.status === 'active' && (h.filter === 'all' || q.type === h.filter))
-    .sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type) || a.createdAt.localeCompare(b.createdAt));
+  const board = prepareBoard(s.quests, mode, { filter: h.filter, showAnyway: h.showAnyway, expanded: h.expanded });
+  const wc = weeklyConsistency(s.completions, s.now, s.profile.weeklyTargetDays);
+  const badges = (q) => el('div', { class: 'badges' },
+    el('span', { class: 'badge' }, QUEST_TYPES[q.type]),
+    el('span', { class: 'badge' }, attrName[q.attributeId] || q.attributeId),
+    el('span', { class: 'badge xp' }, `+${q.xpReward} XP`));
 
-  const card = (q) => {
+  const card = ({ quest: q, collapsed }) => {
+    if (collapsed) {
+      return el('article', { class: 'quest soft' }, el('h3', {}, q.title),
+        el('div', { class: 'badges' }, el('span', { class: 'badge' }, EFFORT_TIERS[q.effortTier].label)),
+        act('Show quest', () => h.onExpand(q.id)));
+    }
     const done = RECURRING.has(q.type) && s.completions.some((c) => c.questId === q.id && c.periodKey === periodKeyFor(q.type, s.now));
     return el('article', { class: 'quest' },
       el('h3', {}, q.title),
       q.finishCondition ? el('p', {}, q.finishCondition) : null,
-      el('div', { class: 'badges' },
-        el('span', { class: 'badge' }, QUEST_TYPES[q.type]),
-        el('span', { class: 'badge' }, attrName[q.attributeId] || q.attributeId),
-        el('span', { class: 'badge xp' }, `+${q.xpReward} XP`)),
-      el('button', { class: 'primary', disabled: done, onclick: () => h.onComplete(q) }, done ? (q.type === 'daily' ? 'Done today' : 'Done this week') : 'Complete'));
+      badges(q),
+      el('button', { class: 'primary', disabled: done, onclick: () => h.onComplete(q) }, done ? (q.type === 'daily' ? 'Done today' : 'Done this week') : 'Complete'),
+      el('div', { class: 'actions' },
+        act('Edit', () => h.onEdit(q)), act('Pause', () => h.onStatus(q, 'pause')),
+        act('Archive', () => h.onStatus(q, 'archive')), act('Delete quest', () => h.onDelete(q), 'danger')));
   };
+
+  const list = (title, quests, buttons) => (quests.length
+    ? el('details', { class: 'manage' }, el('summary', {}, `${title} (${quests.length})`),
+      ...quests.map((q) => el('div', { class: 'mrow' }, el('span', {}, q.title), el('div', { class: 'actions' }, ...buttons(q)))))
+    : null);
+  const withStatus = (st) => s.quests.filter((q) => q.status === st).sort((a, b) => a.title.localeCompare(b.title));
+  const del = (q) => act('Delete quest', () => h.onDelete(q), 'danger');
+
+  const boardNodes = [];
+  if (board.resting) {
+    boardNodes.push(el('div', { class: 'rest' },
+      el('p', {}, 'Rest is part of the schedule. No quests required today.'),
+      act(h.showAnyway ? 'Hide quests' : 'View quests anyway', h.onToggleRest)));
+  }
+  if (board.items.length) boardNodes.push(...board.items.map(card));
+  else if (!board.resting) boardNodes.push(el('p', { class: 'empty' }, 'No quests here yet. Create one to start earning XP.'));
+  else if (h.showAnyway) boardNodes.push(el('p', { class: 'empty' }, 'No active quests to show.'));
 
   root.replaceChildren(
     el('div', { class: 'hero' },
       el('p', { class: 'lvl' }, `Level ${lp.level}`),
       el('p', { class: 'sub' }, `${lp.into} of ${lp.span} XP to level ${lp.level + 1}. Total ${s.profile.totalXp} XP.`),
       bar(lp.pct)),
+    el('div', { class: 'week' },
+      el('b', {}, `${wc.count} / ${wc.target} active days this week`),
+      el('div', { class: 'dots' }, wc.days.map((d, i) => el('span', { class: 'dot' + (d.active ? ' on' : '') + (d.today ? ' today' : ''), title: d.key }, 'MTWTFSS'[i]))),
+      bar(wc.pct, true),
+      el('p', { class: 'sub' }, wc.message)),
     el('h2', {}, 'Attributes'),
     el('div', { class: 'attrs' }, s.attributes.map((a) => {
       const ap = levelProgress(a.totalXp);
       return el('div', { class: 'attr' }, el('b', {}, a.name), el('span', {}, `${a.totalXp} XP`), bar(ap.pct, true));
     })),
-    el('h2', {}, 'Quest board'),
+    el('h2', {}, `Quest board${mode === 'normal' ? '' : ' (' + MODE_LABEL(mode) + ' mode)'}`),
     el('div', { class: 'chips' }, [['all', 'All'], ...Object.entries(QUEST_TYPES)].map(([k, t]) =>
       el('button', { 'aria-pressed': String(h.filter === k), onclick: () => h.onFilter(k) }, t))),
-    ...(quests.length ? quests.map(card) : [el('p', { class: 'empty' }, 'No quests here yet. Create one to start earning XP.')]),
-    el('button', { class: 'primary new', onclick: h.onNew }, 'New quest'));
+    ...boardNodes,
+    el('button', { class: 'primary new', onclick: h.onNew }, 'New quest'),
+    list('Paused quests', withStatus('paused'), (q) => [act('Resume', () => h.onStatus(q, 'resume')), act('Archive', () => h.onStatus(q, 'archive')), del(q)]),
+    list('Completed quests', withStatus('completed'), (q) => [act('Archive', () => h.onStatus(q, 'archive')), del(q)]),
+    list('Archived quests', withStatus('archived'), (q) => [act('Restore', () => h.onStatus(q, 'restore')), del(q)]));
 }
 
 export function renderProfile(s, h) {
@@ -96,8 +132,11 @@ export function renderProfile(s, h) {
   root.replaceChildren(
     el('h2', {}, 'Mode'),
     el('div', { class: 'modes' }, MODES.map((m) =>
-      el('button', { 'aria-pressed': String(s.profile.difficultyMode === m), onclick: () => h.onMode(m) }, m[0].toUpperCase() + m.slice(1)))),
-    el('p', { class: 'sub' }, 'Modes are saved now and will change how quests behave in a later phase.'),
+      el('button', { 'aria-pressed': String(s.profile.difficultyMode === m), onclick: () => h.onMode(m) }, MODE_LABEL(m)))),
+    el('p', { class: 'sub' }, 'Normal shows everything. Gentle puts small tasks first. Rest hides the board and pauses Gold.'),
+    el('h2', {}, 'Weekly target'),
+    el('select', { class: 'inline', 'aria-label': 'Active days per week', onchange: (e) => h.onTarget(Number(e.target.value)) },
+      [1, 2, 3, 4, 5, 6, 7].map((n) => el('option', { value: String(n), selected: n === s.profile.weeklyTargetDays }, `${n} active ${n === 1 ? 'day' : 'days'} per week`))),
     el('h2', {}, 'Data backup'),
     el('div', { class: 'data-actions' },
       el('button', { onclick: h.onExport }, 'Export JSON'),
