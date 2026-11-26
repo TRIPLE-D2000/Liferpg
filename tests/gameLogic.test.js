@@ -108,7 +108,7 @@ test('export then import restores progress', () => withDb(async (db) => {
   await completeQuest(db, q.id);
   const backup = JSON.stringify(await exportData(db));
   const b = JSON.parse(backup);
-  eq([b.app, b.schemaVersion, b.exportFormatVersion], ['life-rpg', 1, 1]);
+  eq([b.app, b.schemaVersion, b.exportFormatVersion], ['life-rpg', 3, 1]);
   const q2 = await quest(db, { type: 'main', effortTier: 'major' });
   await completeQuest(db, q2.id);
   eq((await getState(db)).profile.totalXp, 60);
@@ -142,6 +142,154 @@ test('restore is atomic: a mid-write failure rolls back everything', () => withD
   data.completions.push({ ...data.completions[0], id: 'dup-row' }); // violates the unique index mid-write
   await rejects(restoreInTransaction(db, data));
   eq(JSON.stringify(await getState(db)), before, 'rollback failed:');
+}));
+
+// ---- Migration (DB v1/v2 -> v3) and v1/v2/v3 backups
+const T = '2026-11-20T10:00:00.000Z';
+const rawOpen = (name, version, upgrade) => new Promise((res, rej) => {
+  const r = indexedDB.open(name, version);
+  r.onupgradeneeded = () => upgrade(r.result);
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const putAll = (db, store, rows) => new Promise((res, rej) => {
+  const tx = db.transaction(store, 'readwrite');
+  rows.forEach((r) => tx.objectStore(store).put(r));
+  tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+});
+function legacySchema(db) { // exactly the Phase 1 schema
+  db.createObjectStore('profile', { keyPath: 'id' });
+  db.createObjectStore('attributes', { keyPath: 'id' });
+  db.createObjectStore('quests', { keyPath: 'id' });
+  const c = db.createObjectStore('completions', { keyPath: 'id' });
+  c.createIndex('byQuestPeriod', ['questId', 'periodKey'], { unique: true });
+  c.createIndex('byCompletedAt', 'completedAt');
+}
+const attrRows = () => ['craft', 'body', 'mind', 'order'].map((id) => ({ id, name: id[0].toUpperCase() + id.slice(1), totalXp: id === 'mind' ? 35 : 0 }));
+async function withLegacy(version, profileExtra, questExtra, fn) {
+  const name = 'life_rpg_legacy_' + Math.random().toString(36).slice(2);
+  const raw = await rawOpen(name, version, legacySchema);
+  await putAll(raw, 'profile', [{ id: 'player_1', displayName: 'Daniel', totalXp: 35, difficultyMode: 'gentle', createdAt: T, updatedAt: T, ...profileExtra }]);
+  await putAll(raw, 'attributes', attrRows());
+  await putAll(raw, 'quests', [{ id: 'q1', title: 'Read', finishCondition: '', type: 'daily', effortTier: 'standard', attributeId: 'mind', xpReward: 10, status: 'active', createdAt: T, ...questExtra }]);
+  await putAll(raw, 'completions', [{ id: 'c1', questId: 'q1', periodKey: '2026-11-20', questTitleSnapshot: 'Read', attributeId: 'mind', xpAwarded: 35, completedAt: T }]);
+  raw.close();
+  const db = await openDatabase(name);
+  try { await fn(db); } finally { db.close(); indexedDB.deleteDatabase(name); }
+}
+const storeNames = (db) => [...db.objectStoreNames].sort();
+const V3_STORES = ['attributes', 'completions', 'currencyLedger', 'profile', 'quests', 'redemptions', 'rewards'];
+
+test('fresh database is v3 with the new stores and indexes', () => withDb(async (db) => {
+  eq(db.version, 3); eq(storeNames(db), V3_STORES);
+  const tx = db.transaction(['currencyLedger', 'rewards', 'redemptions'], 'readonly');
+  eq([...tx.objectStore('currencyLedger').indexNames].sort(), ['byCompletion', 'byCreatedAt', 'byRedemption', 'byTransactionKey']);
+  eq([...tx.objectStore('rewards').indexNames], ['byCreatedAt']);
+  eq([...tx.objectStore('redemptions').indexNames].sort(), ['byRedeemedAt', 'byRewardId']);
+  eq((await getState(db)).profile.weeklyTargetDays, 4);
+}));
+test('ledger transactionKey is unique at the database layer', () => withDb(async (db) => {
+  const row = (id) => ({ id, amount: 5, reason: 'x', relatedCompletionId: null, relatedRedemptionId: null, createdAt: T, transactionKey: 'same' });
+  const err = await new Promise((res) => {
+    const st = db.transaction('currencyLedger', 'readwrite').objectStore('currencyLedger');
+    st.add(row('a'));
+    const r = st.add(row('b'));
+    r.onerror = (e) => { e.preventDefault(); res(r.error.name); };
+    r.onsuccess = () => res('no error');
+  });
+  eq(err, 'ConstraintError');
+}));
+test('v1 -> v3 migration preserves data and adds safe defaults', () => withLegacy(1, {}, {}, async (db) => {
+  eq(db.version, 3); eq(storeNames(db), V3_STORES);
+  const s = await getState(db);
+  eq([s.profile.totalXp, s.profile.difficultyMode, s.profile.displayName], [35, 'gentle', 'Daniel']);
+  eq(s.profile.weeklyTargetDays, 4);
+  eq(s.attributes.find((a) => a.id === 'mind').totalXp, 35);
+  eq([s.quests[0].isGoldEligible, s.quests[0].updatedAt, s.quests[0].status, s.quests[0].title], [true, T, 'active', 'Read']);
+  eq(s.completions.length, 1); eq(s.completions[0].xpAwarded, 35);
+  ok(!('goldAwarded' in s.completions[0]), 'old completions must not gain Gold');
+  eq(s.currencyLedger.length, 0); eq(s.rewards.length, 0); eq(s.redemptions.length, 0);
+}));
+test('v2 -> v3 migration keeps Phase 2 values and adds Gold fields', () =>
+  withLegacy(2, { weeklyTargetDays: 6 }, { updatedAt: '2026-11-22T00:00:00.000Z', status: 'paused' }, async (db) => {
+    eq(db.version, 3);
+    const s = await getState(db);
+    eq(s.profile.weeklyTargetDays, 6);
+    eq([s.quests[0].updatedAt, s.quests[0].status, s.quests[0].isGoldEligible], ['2026-11-22T00:00:00.000Z', 'paused', true]);
+    eq(s.currencyLedger.length, 0);
+  }));
+test('migrated database still completes quests correctly', () => withLegacy(1, {}, {}, async (db) => {
+  const c = await completeQuest(db, 'q1', at(2026, 11, 26));
+  eq(c.xpAwarded, 10);
+  await rejects(completeQuest(db, 'q1', at(2026, 11, 26, 20)), 'DuplicateCompletionError');
+  eq((await getState(db)).profile.totalXp, 45);
+}));
+
+const baseData = () => ({
+  profile: [{ id: 'player_1', displayName: 'Player', totalXp: 10, difficultyMode: 'normal', createdAt: T, updatedAt: T }],
+  attributes: attrRows().map((a) => ({ ...a, totalXp: a.id === 'mind' ? 10 : 0 })),
+  quests: [{ id: 'q1', title: 'Old quest', finishCondition: '', type: 'main', effortTier: 'standard', attributeId: 'mind', xpReward: 10, status: 'completed', createdAt: T }],
+  completions: [{ id: 'c1', questId: 'q1', periodKey: 'once', questTitleSnapshot: 'Old quest', attributeId: 'mind', xpAwarded: 10, completedAt: T }],
+});
+const backup = (v, data) => JSON.stringify({ app: 'life-rpg', schemaVersion: v, exportFormatVersion: 1, exportedAt: T, data });
+const goldData = () => ({
+  ...baseData(),
+  rewards: [{ id: 'r1', title: 'Movie night', description: '', goldCost: 30, isActive: true, createdAt: T, updatedAt: T }],
+  redemptions: [{ id: 'd1', rewardId: 'r1', rewardTitleSnapshot: 'Movie night', goldSpent: 30, status: 'redeemed', redeemedAt: '2026-11-21T10:00:00.000Z' }],
+  currencyLedger: [
+    { id: 'l1', amount: 50, reason: 'Quest completed', relatedCompletionId: 'c1', relatedRedemptionId: null, createdAt: T, transactionKey: 'completion:c1' },
+    { id: 'l2', amount: -30, reason: 'Reward redeemed', relatedCompletionId: null, relatedRedemptionId: 'd1', createdAt: '2026-11-21T10:00:00.000Z', transactionKey: 'redeem:d1' },
+  ],
+});
+const sumLedger = (s) => s.currencyLedger.reduce((n, l) => n + l.amount, 0);
+const patched = (fn) => { const d = goldData(); fn(d); return backup(3, d); };
+
+test('v1 backup imports with defaults and no retroactive Gold', () => withDb(async (db) => {
+  await importData(db, backup(1, baseData()));
+  const s = await getState(db);
+  eq([s.profile.weeklyTargetDays, s.quests[0].isGoldEligible, s.quests[0].updatedAt], [4, true, T]);
+  eq(s.completions.length, 1); ok(!('goldAwarded' in s.completions[0]), 'no goldAwarded');
+  eq(s.currencyLedger.length, 0); eq(sumLedger(s), 0);
+}));
+test('v2 backup imports and keeps weeklyTargetDays', () => withDb(async (db) => {
+  const d = baseData(); d.profile[0].weeklyTargetDays = 6;
+  await importData(db, backup(2, d));
+  const s = await getState(db);
+  eq([s.profile.weeklyTargetDays, sumLedger(s)], [6, 0]);
+}));
+test('v3 backup restores ledger, rewards, redemptions and the derived balance', () => withDb(async (db) => {
+  await importData(db, backup(3, goldData()));
+  const s = await getState(db);
+  eq([s.rewards.length, s.redemptions.length, s.currencyLedger.length], [1, 1, 2]);
+  eq(sumLedger(s), 20);
+  const again = JSON.parse(JSON.stringify(await exportData(db)));
+  eq([again.schemaVersion, again.data.currencyLedger.length], [3, 2]);
+}));
+test('completions whose quest was deleted are valid history', () => withDb(async (db) => {
+  const d = baseData(); d.quests = [];
+  await importData(db, backup(1, d));
+  eq((await getState(db)).completions[0].questTitleSnapshot, 'Old quest');
+}));
+test('invalid v3 backups are rejected without touching existing data', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'main' });
+  await completeQuest(db, q.id);
+  const before = JSON.stringify(await getState(db));
+  const bads = [
+    patched((d) => { d.currencyLedger[1].transactionKey = 'completion:c1'; }),          // duplicate transaction key
+    patched((d) => { d.currencyLedger[0].amount = 0; }),                                  // zero amount
+    patched((d) => { d.currencyLedger[0].amount = 2.5; }),                                // non-integer
+    patched((d) => { d.currencyLedger[0].amount = 10; }),                                 // 10 - 30 < 0
+    patched((d) => { d.currencyLedger[1].relatedRedemptionId = 'nope'; }),                // dangling redemption
+    patched((d) => { d.currencyLedger[0].relatedCompletionId = 'nope'; }),                // dangling completion
+    patched((d) => { d.currencyLedger.pop(); }),                                          // redemption without debit
+    patched((d) => { d.redemptions[0].rewardId = 'nope'; }),                              // unknown reward
+    patched((d) => { d.rewards[0].goldCost = 0; }),                                       // bad cost
+    patched((d) => { d.redemptions[0].status = 'refunded'; }),                            // refunded with no refund credit
+    patched((d) => { delete d.rewards; }),                                                // v3 must include every store
+    backup(4, goldData()),                                                                // unknown future version
+  ];
+  for (const bad of bads) await rejects(importData(db, bad), 'BackupValidationError');
+  eq(JSON.stringify(await getState(db)), before, 'state changed:');
 }));
 
 // ---- Runner
