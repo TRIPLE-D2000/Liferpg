@@ -30,15 +30,16 @@
 
 <dialog id="quest-dialog">
   <form method="dialog" id="quest-form">
-    <h3>New quest</h3>
+    <h3 id="quest-dialog-title">New quest</h3>
     <label>Title <input name="title" required maxlength="80" autocomplete="off"></label>
     <label>Finish condition (optional) <input name="finishCondition" maxlength="140" autocomplete="off"></label>
     <label>Quest type <select name="type"></select></label>
     <label>Linked attribute <select name="attributeId"></select></label>
     <label>Effort tier <select name="effortTier"></select></label>
+    <label class="check"><input type="checkbox" name="isGoldEligible" checked> Earns Gold when completed</label>
     <div class="row">
       <button value="cancel" formnovalidate>Cancel</button>
-      <button value="ok" class="primary">Create quest</button>
+      <button value="ok" class="primary" id="quest-submit">Create quest</button>
     </div>
   </form>
 </dialog>
