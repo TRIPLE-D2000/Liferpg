@@ -1,5 +1,5 @@
 // IndexedDB wrapper: schema, seeding, atomic completion, backup/restore.
-import { EFFORT_TIERS, QUEST_TYPES, MODES, DEFAULT_ATTRIBUTES, periodKeyFor, xpForTier } from './gameLogic.js';
+import { EFFORT_TIERS, QUEST_TYPES, MODES, DEFAULT_ATTRIBUTES, RECURRING, periodKeyFor, xpForTier } from './gameLogic.js';
 
 export const DB_NAME = 'life_rpg';
 export const DB_VERSION = 3;
@@ -85,18 +85,77 @@ export async function getState(db) {
   return { profile: profiles[0], attributes, quests, completions, currencyLedger, rewards, redemptions };
 }
 
-export async function createQuest(db, { title, finishCondition = '', type, effortTier, attributeId }) {
+export async function createQuest(db, { title, finishCondition = '', type, effortTier, attributeId, isGoldEligible = true }) {
   title = (title || '').trim();
   if (!title) throw new Error('Title is required.');
   if (!QUEST_TYPES[type]) throw new Error('Unknown quest type.');
   const xpReward = xpForTier(effortTier);
   const tx = db.transaction(['attributes', 'quests'], 'readwrite');
   if (!(await wrap(tx.objectStore('attributes').get(attributeId)))) { tx.abort(); throw new Error('Unknown attribute.'); }
-  const quest = { id: newId(), title, finishCondition: (finishCondition || '').trim(), type, effortTier, attributeId, xpReward, status: 'active', isGoldEligible: true, createdAt: new Date().toISOString() };
+  const quest = { id: newId(), title, finishCondition: (finishCondition || '').trim(), type, effortTier, attributeId, xpReward, status: 'active', isGoldEligible: !!isGoldEligible, createdAt: new Date().toISOString() };
   quest.updatedAt = quest.createdAt;
   tx.objectStore('quests').add(quest);
   await txDone(tx);
   return quest;
+}
+
+const abortWith = (tx, msg) => { tx.abort(); throw new Error(msg); };
+
+// Edits change the quest definition only. Past completions keep their own snapshots.
+export async function updateQuest(db, id, f) {
+  const has = (k) => f[k] !== undefined;
+  if (has('title') && !String(f.title).trim()) throw new Error('Title is required.');
+  if (has('type') && !QUEST_TYPES[f.type]) throw new Error('Unknown quest type.');
+  if (has('effortTier')) xpForTier(f.effortTier);
+  const tx = db.transaction(['attributes', 'quests'], 'readwrite');
+  const q = await wrap(tx.objectStore('quests').get(id));
+  if (!q) abortWith(tx, 'Quest not found.');
+  if (has('attributeId') && !(await wrap(tx.objectStore('attributes').get(f.attributeId)))) abortWith(tx, 'Unknown attribute.');
+  const next = { ...q, updatedAt: new Date().toISOString() };
+  if (has('title')) next.title = String(f.title).trim();
+  if (has('finishCondition')) next.finishCondition = String(f.finishCondition).trim();
+  if (has('type')) next.type = f.type;
+  if (has('attributeId')) next.attributeId = f.attributeId;
+  if (has('effortTier')) { next.effortTier = f.effortTier; next.xpReward = xpForTier(f.effortTier); }
+  if (has('isGoldEligible')) next.isGoldEligible = !!f.isGoldEligible;
+  if (RECURRING.has(next.type) && next.status === 'completed') next.status = 'active'; // recurring quests are never "completed"
+  tx.objectStore('quests').put(next);
+  await txDone(tx);
+  return next;
+}
+
+// pause / resume / archive / restore. None of these touch XP, completions or Gold.
+export async function changeQuestStatus(db, id, action) {
+  const from = { pause: ['active'], resume: ['paused'], archive: ['active', 'paused', 'completed'], restore: ['archived'] }[action];
+  if (!from) throw new Error('Unknown quest action.');
+  const tx = db.transaction(['quests', 'completions'], 'readwrite');
+  const q = await wrap(tx.objectStore('quests').get(id));
+  if (!q) abortWith(tx, 'Quest not found.');
+  if (!from.includes(q.status)) abortWith(tx, `Cannot ${action} a ${q.status} quest.`);
+  let status = { pause: 'paused', resume: 'active', archive: 'archived', restore: 'active' }[action];
+  if (action === 'restore' && !RECURRING.has(q.type) && await wrap(tx.objectStore('completions').index('byQuestPeriod').get([id, 'once']))) {
+    status = 'completed'; // a one-time quest that was already finished must not become completable again
+  }
+  tx.objectStore('quests').put({ ...q, status, updatedAt: new Date().toISOString() });
+  await txDone(tx);
+  return status;
+}
+
+// Permanent delete: removes ONLY the quest definition. Completions, XP and ledger rows stay (they keep questId + title snapshot).
+export async function deleteQuest(db, id) {
+  const tx = db.transaction('quests', 'readwrite');
+  if (!(await wrap(tx.objectStore('quests').get(id)))) abortWith(tx, 'Quest not found.');
+  tx.objectStore('quests').delete(id);
+  await txDone(tx);
+}
+
+export async function setWeeklyTarget(db, days) {
+  if (!Number.isInteger(days) || days < 1 || days > 7) throw new Error('Weekly target must be a whole number from 1 to 7.');
+  const tx = db.transaction('profile', 'readwrite');
+  const p = await wrap(tx.objectStore('profile').get('player_1'));
+  p.weeklyTargetDays = days; p.updatedAt = new Date().toISOString();
+  tx.objectStore('profile').put(p);
+  await txDone(tx);
 }
 
 // One atomic transaction: completion row + player XP + attribute XP (+ close one-time quests).
