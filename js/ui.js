@@ -1,5 +1,5 @@
 // DOM rendering only. Text is always inserted as text nodes (no innerHTML).
-import { EFFORT_TIERS, QUEST_TYPES, RECURRING, MODES, levelProgress, periodKeyFor, formatLocal, prepareBoard, weeklyConsistency } from './gameLogic.js';
+import { EFFORT_TIERS, QUEST_TYPES, RECURRING, MODES, levelProgress, periodKeyFor, formatLocal, prepareBoard, weeklyConsistency, goldBalance } from './gameLogic.js';
 
 const $ = (s) => document.querySelector(s);
 
@@ -100,11 +100,13 @@ export function renderHome(s, h) {
   else if (!board.resting) boardNodes.push(el('p', { class: 'empty' }, 'No quests here yet. Create one to start earning XP.'));
   else if (h.showAnyway) boardNodes.push(el('p', { class: 'empty' }, 'No active quests to show.'));
 
-  root.replaceChildren(
+  // Optional sections are null when empty; filter them out (replaceChildren would print "null").
+  root.replaceChildren(...[
     el('div', { class: 'hero' },
       el('p', { class: 'lvl' }, `Level ${lp.level}`),
       el('p', { class: 'sub' }, `${lp.into} of ${lp.span} XP to level ${lp.level + 1}. Total ${s.profile.totalXp} XP.`),
-      bar(lp.pct)),
+      bar(lp.pct),
+      el('p', { class: 'sub' }, `${goldBalance(s.currencyLedger)} Gold`)),
     el('div', { class: 'week' },
       el('b', {}, `${wc.count} / ${wc.target} active days this week`),
       el('div', { class: 'dots' }, wc.days.map((d, i) => el('span', { class: 'dot' + (d.active ? ' on' : '') + (d.today ? ' today' : ''), title: d.key }, 'MTWTFSS'[i]))),
@@ -122,7 +124,8 @@ export function renderHome(s, h) {
     el('button', { class: 'primary new', onclick: h.onNew }, 'New quest'),
     list('Paused quests', withStatus('paused'), (q) => [act('Resume', () => h.onStatus(q, 'resume')), act('Archive', () => h.onStatus(q, 'archive')), del(q)]),
     list('Completed quests', withStatus('completed'), (q) => [act('Archive', () => h.onStatus(q, 'archive')), del(q)]),
-    list('Archived quests', withStatus('archived'), (q) => [act('Restore', () => h.onStatus(q, 'restore')), del(q)]));
+    list('Archived quests', withStatus('archived'), (q) => [act('Restore', () => h.onStatus(q, 'restore')), del(q)]),
+  ].filter(Boolean));
 }
 
 export function renderProfile(s, h) {
@@ -145,6 +148,6 @@ export function renderProfile(s, h) {
     history.length
       ? el('ul', { class: 'log' }, history.map((c) => el('li', {},
         el('div', {}, el('b', {}, c.questTitleSnapshot), el('br'), el('small', {}, `${attrName[c.attributeId] || c.attributeId}, ${formatLocal(c.completedAt)}`)),
-        el('span', { class: 'gain' }, `+${c.xpAwarded} XP`))))
+        el('span', { class: 'gain' }, `+${c.xpAwarded} XP` + (c.goldAwarded > 0 ? `, +${c.goldAwarded} Gold` : '')))))
       : el('p', { class: 'empty' }, 'Nothing completed yet. Finished quests will appear here.'));
 }
