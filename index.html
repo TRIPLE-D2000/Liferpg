@@ -10,10 +10,12 @@
 <header class="top"><h1>Life RPG</h1></header>
 <main>
   <section id="screen-home" class="screen"></section>
+  <section id="screen-rewards" class="screen" hidden></section>
   <section id="screen-profile" class="screen" hidden></section>
 </main>
 <nav class="tabs" aria-label="Screens">
   <button data-screen="home" class="on">Home</button>
+  <button data-screen="rewards">Rewards</button>
   <button data-screen="profile">Profile</button>
 </nav>
 <div id="toast" role="status" aria-live="polite" hidden></div>
@@ -40,6 +42,19 @@
     <div class="row">
       <button value="cancel" formnovalidate>Cancel</button>
       <button value="ok" class="primary" id="quest-submit">Create quest</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="reward-dialog">
+  <form method="dialog" id="reward-form">
+    <h3 id="reward-dialog-title">New reward</h3>
+    <label>Title <input name="title" required maxlength="80" autocomplete="off"></label>
+    <label>Description (optional) <input name="description" maxlength="300" autocomplete="off"></label>
+    <label>Gold cost <input name="goldCost" type="number" inputmode="numeric" min="1" max="100000" step="1" required></label>
+    <div class="row">
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button value="ok" class="primary" id="reward-submit">Create reward</button>
     </div>
   </form>
 </dialog>
