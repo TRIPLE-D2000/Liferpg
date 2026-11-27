@@ -69,3 +69,9 @@ details.manage summary{cursor:pointer;min-height:40px;display:flex;align-items:c
 label.check{display:flex;align-items:center;gap:10px;color:var(--text)}
 dialog label.check input{display:inline-block;width:auto;margin:0}
 select.inline{background:#101722;border:1px solid var(--line);border-radius:8px;padding:10px;min-height:44px}
+
+.goldhero{background:var(--panel);border:1px solid var(--xp);border-radius:14px;padding:16px}
+.goldhero .amt{margin:0;font-size:2rem;font-weight:700;color:var(--xp)}
+.credit{color:var(--ok);font-weight:600;white-space:nowrap}
+.debit{color:var(--danger);font-weight:600;white-space:nowrap}
+.hist-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
