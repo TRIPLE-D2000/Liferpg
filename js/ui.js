@@ -1,5 +1,5 @@
 // DOM rendering only. Text is always inserted as text nodes (no innerHTML).
-import { EFFORT_TIERS, QUEST_TYPES, RECURRING, MODES, levelProgress, periodKeyFor, formatLocal, prepareBoard, weeklyConsistency, goldBalance } from './gameLogic.js';
+import { EFFORT_TIERS, QUEST_TYPES, RECURRING, MODES, levelProgress, periodKeyFor, formatLocal, prepareBoard, weeklyConsistency, goldBalance, buildHistory } from './gameLogic.js';
 
 const $ = (s) => document.querySelector(s);
 
@@ -17,7 +17,7 @@ export function el(tag, props = {}, ...kids) {
 const bar = (pct, mini) => el('div', { class: 'bar' + (mini ? ' mini' : '') }, el('div', { class: 'fill', style: `width:${pct}%` }));
 
 export function showScreen(name) {
-  for (const s of ['home', 'profile']) $(`#screen-${s}`).hidden = s !== name;
+  for (const s of ['home', 'rewards', 'profile']) $(`#screen-${s}`).hidden = s !== name;
   document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('on', b.dataset.screen === name));
 }
 
@@ -44,11 +44,11 @@ export function confirmDialog(title, body, okLabel = 'Confirm') {
 export function fillQuestForm() {
   const f = $('#quest-form');
   const opts = (sel, pairs) => sel.replaceChildren(...pairs.map(([v, t]) => el('option', { value: v }, t)));
-  opts(f.type, Object.entries(QUEST_TYPES));
-  opts(f.effortTier, Object.entries(EFFORT_TIERS).map(([k, t]) => [k, `${t.label} (${t.xp} XP)`]));
+  opts(f.elements.type, Object.entries(QUEST_TYPES));
+  opts(f.elements.effortTier, Object.entries(EFFORT_TIERS).map(([k, t]) => [k, `${t.label} (${t.xp} XP)`]));
 }
 export function setAttributeOptions(attributes) {
-  $('#quest-form').attributeId.replaceChildren(...attributes.map((a) => el('option', { value: a.id }, a.name)));
+  $('#quest-form').elements.attributeId.replaceChildren(...attributes.map((a) => el('option', { value: a.id }, a.name)));
 }
 
 const act = (label, fn, cls = '') => el('button', { class: ('sm ' + cls).trim(), onclick: fn }, label);
@@ -150,4 +150,50 @@ export function renderProfile(s, h) {
         el('div', {}, el('b', {}, c.questTitleSnapshot), el('br'), el('small', {}, `${attrName[c.attributeId] || c.attributeId}, ${formatLocal(c.completedAt)}`)),
         el('span', { class: 'gain' }, `+${c.xpAwarded} XP` + (c.goldAwarded > 0 ? `, +${c.goldAwarded} Gold` : '')))))
       : el('p', { class: 'empty' }, 'Nothing completed yet. Finished quests will appear here.'));
+}
+
+export function renderRewards(s, h) {
+  const root = $('#screen-rewards');
+  const balance = goldBalance(s.currencyLedger);
+  const byCost = (a, b) => a.goldCost - b.goldCost || a.title.localeCompare(b.title);
+  const active = s.rewards.filter((r) => r.isActive).sort(byCost);
+  const archived = s.rewards.filter((r) => !r.isActive).sort((a, b) => a.title.localeCompare(b.title));
+  const history = buildHistory(s);
+  const KIND = { earned: 'Earned', spent: 'Spent', refund: 'Refund', adjustment: 'Adjustment' };
+
+  const card = (r) => {
+    const short = r.goldCost - balance;
+    return el('article', { class: 'quest' },
+      el('h3', {}, r.title),
+      r.description ? el('p', {}, r.description) : null,
+      el('div', { class: 'badges' }, el('span', { class: 'badge xp' }, `${r.goldCost} Gold`)),
+      el('button', { class: 'primary', disabled: short > 0, onclick: () => h.onRedeem(r, balance) }, 'Redeem'),
+      short > 0 ? el('p', { class: 'sub' }, `You need ${short} more Gold for this reward.`) : null,
+      el('div', { class: 'actions' }, act('Edit', () => h.onEditReward(r)), act('Archive', () => h.onArchiveReward(r))));
+  };
+
+  root.replaceChildren(...[
+    el('div', { class: 'goldhero' },
+      el('p', { class: 'amt' }, `${balance} Gold`),
+      el('p', { class: 'sub' }, s.profile.difficultyMode === 'rest'
+        ? 'Rest mode is on. Quests you finish now still earn XP, but no Gold.'
+        : 'Earned by finishing Gold-eligible quests. Spend it on real-world rewards.')),
+    el('h2', {}, 'Reward shop'),
+    ...(active.length ? active.map(card) : [el('p', { class: 'empty' }, 'No rewards yet. Add something you would genuinely enjoy, like a favorite meal or a free evening.')]),
+    el('button', { class: 'primary new', onclick: h.onNewReward }, 'New reward'),
+    archived.length
+      ? el('details', { class: 'manage' }, el('summary', {}, `Archived rewards (${archived.length})`),
+        ...archived.map((r) => el('div', { class: 'mrow' }, el('span', {}, `${r.title} (${r.goldCost} Gold)`),
+          el('div', { class: 'actions' }, act('Restore', () => h.onRestoreReward(r))))))
+      : null,
+    el('h2', {}, 'Gold history'),
+    history.length
+      ? el('ul', { class: 'log' }, history.map((x) => el('li', {},
+        el('div', {}, el('b', {}, x.title), el('br'),
+          el('small', {}, `${KIND[x.kind]}, ${formatLocal(x.createdAt)}${x.kind === 'spent' && x.status === 'refunded' ? ', refunded' : ''}`)),
+        el('div', { class: 'hist-right' },
+          el('span', { class: x.amount > 0 ? 'credit' : 'debit' }, `${x.amount > 0 ? '+' : '-'}${Math.abs(x.amount)} Gold`),
+          x.kind === 'spent' && x.status === 'redeemed' ? act('Refund', () => h.onRefund(x.redemptionId, x.title, Math.abs(x.amount))) : null))))
+      : el('p', { class: 'empty' }, 'No Gold activity yet. Finish a quest to earn your first Gold.'),
+  ].filter(Boolean));
 }
