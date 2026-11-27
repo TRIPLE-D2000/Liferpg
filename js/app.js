@@ -1,11 +1,11 @@
 // State coordination and event wiring.
-import { openDatabase, getState, createQuest, updateQuest, changeQuestStatus, deleteQuest, completeQuest, setDifficultyMode, setWeeklyTarget, exportData, importData, DuplicateCompletionError } from './db.js';
+import { openDatabase, getState, createQuest, updateQuest, changeQuestStatus, deleteQuest, completeQuest, setDifficultyMode, setWeeklyTarget, exportData, importData, createReward, updateReward, setRewardActive, redeemReward, refundRedemption, DuplicateCompletionError } from './db.js';
 import { levelFromXp, localDayKey, goldAwardFor } from './gameLogic.js';
 import * as ui from './ui.js';
 
 let db;
 const inFlight = new Set();
-const state = { screen: 'home', filter: 'all', showAnyway: false, expanded: new Set(), editId: null, data: null };
+const state = { screen: 'home', filter: 'all', showAnyway: false, expanded: new Set(), editId: null, editRewardId: null, data: null };
 const $ = (id) => document.getElementById(id);
 
 async function refresh() {
@@ -17,6 +17,7 @@ function render() {
   const s = { ...state.data, now: new Date() };
   ui.renderHome(s, { filter: state.filter, showAnyway: state.showAnyway, expanded: state.expanded,
     onFilter, onComplete, onNew, onEdit, onStatus, onDelete, onExpand, onToggleRest });
+  ui.renderRewards(s, { onNewReward, onEditReward, onArchiveReward, onRestoreReward, onRedeem, onRefund });
   ui.renderProfile(s, { onMode, onTarget, onExport, onImport });
   ui.showScreen(state.screen);
 }
@@ -47,8 +48,8 @@ function openQuestDialog(q) {
   state.editId = q ? q.id : null;
   f.reset();
   if (q) {
-    f.title.value = q.title; f.finishCondition.value = q.finishCondition || ''; f.type.value = q.type;
-    f.attributeId.value = q.attributeId; f.effortTier.value = q.effortTier; f.isGoldEligible.checked = q.isGoldEligible !== false;
+    f.elements.title.value = q.title; f.elements.finishCondition.value = q.finishCondition || ''; f.elements.type.value = q.type;
+    f.elements.attributeId.value = q.attributeId; f.elements.effortTier.value = q.effortTier; f.elements.isGoldEligible.checked = q.isGoldEligible !== false;
   }
   $('quest-dialog-title').textContent = q ? 'Edit quest' : 'New quest';
   $('quest-submit').textContent = q ? 'Save changes' : 'Create quest';
@@ -75,6 +76,47 @@ const onDelete = guard(async (q) => {
   ui.toast('Quest deleted. Your history is kept.');
 });
 
+// ---- Rewards
+const newRequestId = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+
+function openRewardDialog(r) {
+  const d = $('reward-dialog'), f = $('reward-form');
+  state.editRewardId = r ? r.id : null;
+  f.reset();
+  if (r) { f.elements.title.value = r.title; f.elements.description.value = r.description || ''; f.elements.goldCost.value = String(r.goldCost); }
+  $('reward-dialog-title').textContent = r ? 'Edit reward' : 'New reward';
+  $('reward-submit').textContent = r ? 'Save changes' : 'Create reward';
+  d.returnValue = '';
+  d.showModal();
+}
+const onNewReward = () => openRewardDialog(null);
+const onEditReward = (r) => openRewardDialog(r);
+
+const onArchiveReward = guard(async (r) => { await setRewardActive(db, r.id, false); await refresh(); ui.toast('Reward archived. Past redemptions are kept.'); });
+const onRestoreReward = guard(async (r) => { await setRewardActive(db, r.id, true); await refresh(); ui.toast('Reward restored.'); });
+
+const onRedeem = guard(async (r, balance) => {
+  const key = 'redeem:' + r.id;
+  if (inFlight.has(key)) return;
+  const ok = await ui.confirmDialog('Redeem this reward?', `"${r.title}" costs ${r.goldCost} Gold. You have ${balance} Gold, leaving ${balance - r.goldCost}.`, 'Redeem');
+  if (!ok) return;
+  inFlight.add(key);
+  try { await redeemReward(db, r.id, { requestId: newRequestId() }); }
+  catch (e) { await refresh(); throw e; } // the database re-checks everything; show its answer and resync the screen
+  finally { inFlight.delete(key); }
+  await refresh();
+  ui.toast(`Redeemed "${r.title}". Enjoy it.`);
+});
+
+const onRefund = guard(async (redemptionId, title, gold) => {
+  const ok = await ui.confirmDialog('Refund this redemption?', `You will get ${gold} Gold back for "${title}". The original purchase stays in your history.`, 'Refund');
+  if (!ok) return;
+  try { await refundRedemption(db, redemptionId); }
+  catch (e) { await refresh(); throw e; }
+  await refresh();
+  ui.toast(`Refunded ${gold} Gold.`);
+});
+
 const onMode = guard(async (m) => { await setDifficultyMode(db, m); state.showAnyway = false; await refresh(); });
 const onTarget = guard(async (n) => { await setWeeklyTarget(db, n); await refresh(); ui.toast('Weekly target updated.'); });
 
@@ -95,10 +137,18 @@ async function init() {
   $('quest-dialog').addEventListener('close', guard(async (e) => {
     if (e.target.returnValue !== 'ok') return;
     const f = $('quest-form');
-    const fields = { title: f.title.value, finishCondition: f.finishCondition.value, type: f.type.value, attributeId: f.attributeId.value,
-      effortTier: f.effortTier.value, isGoldEligible: f.isGoldEligible.checked };
+    const fields = { title: f.elements.title.value, finishCondition: f.elements.finishCondition.value, type: f.elements.type.value, attributeId: f.elements.attributeId.value,
+      effortTier: f.elements.effortTier.value, isGoldEligible: f.elements.isGoldEligible.checked };
     if (state.editId) { await updateQuest(db, state.editId, fields); await refresh(); ui.toast('Quest updated. Past completions are unchanged.'); }
     else { await createQuest(db, fields); await refresh(); ui.toast('Quest created.'); }
+  }));
+
+  $('reward-dialog').addEventListener('close', guard(async (e) => {
+    if (e.target.returnValue !== 'ok') return;
+    const f = $('reward-form');
+    const fields = { title: f.elements.title.value, description: f.elements.description.value, goldCost: f.elements.goldCost.value === '' ? NaN : Number(f.elements.goldCost.value) };
+    if (state.editRewardId) { await updateReward(db, state.editRewardId, fields); await refresh(); ui.toast('Reward updated. Past redemptions are unchanged.'); }
+    else { await createReward(db, fields); await refresh(); ui.toast('Reward created.'); }
   }));
 
   const input = $('import-file');
