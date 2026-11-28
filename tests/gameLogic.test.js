@@ -1,5 +1,6 @@
 // Zero-dependency test runner. Serve the project over http (not file://) and open tests/test.html.
 import { EFFORT_TIERS, xpForTier, xpForLevel, levelFromXp, localDayKey, localWeekKey, periodKeyFor, prepareBoard, weekDays, weeklyConsistency, GOLD_BY_TIER, goldForTier, goldAwardFor, goldBalance, validateReward, buildHistory } from '../js/gameLogic.js';
+import { createAuth, classify } from '../js/auth.js';
 import { openDatabase, getState, createQuest, completeQuest, updateQuest, changeQuestStatus, deleteQuest, setWeeklyTarget, setDifficultyMode, createReward, updateReward, setRewardActive, redeemReward, refundRedemption, InsufficientGoldError, DuplicateRedemptionError, AlreadyRefundedError, exportData, importData, restoreInTransaction, DuplicateCompletionError, BackupValidationError } from '../js/db.js';
 
 const tests = [];
@@ -761,6 +762,146 @@ test('backup of rewards, redemptions and refunds restores balances and statuses 
   await rejects(importData(db, JSON.stringify(bad)), 'BackupValidationError'); // redemption lost its debit
   eq(await bal(db), want);
 }));
+
+// ---- Accounts (Supabase Auth, with a fake client: no network in tests)
+const GOOD = { user: { id: 'u-1', email: 'daniel@example.com' }, expires_at: Math.floor(Date.now() / 1000) + 3600 };
+function fakeClient(session = null) {
+  const calls = [], listeners = [];
+  const c = {
+    calls, session,
+    next: {},
+    emit: (e, s) => listeners.forEach((f) => f(e, s)),
+    auth: {
+      onAuthStateChange(fn) { listeners.push(fn); return { data: { subscription: { unsubscribe() {} } } }; },
+      async getSession() { return { data: { session: c.session }, error: null }; },
+      async signUp(a) { calls.push(['signUp', a]); return c.next.signUp ?? { data: { session: null, user: {} }, error: null }; },
+      async signInWithPassword(a) { calls.push(['signIn', a]); const r = c.next.signIn ?? { data: { session: GOOD }, error: null }; if (r.data && r.data.session) c.session = r.data.session; return r; },
+      async signOut(a) { calls.push(['signOut', a]); if (c.next.signOutThrows) throw new Error('Failed to fetch'); c.session = null; return { error: null }; },
+      async resetPasswordForEmail(e, o) { calls.push(['reset', e, o]); return c.next.reset ?? { data: {}, error: null }; },
+      async updateUser(a) { calls.push(['update', a]); return c.next.update ?? { data: { user: GOOD.user }, error: null }; },
+    },
+  };
+  return c;
+}
+const mkAuth = async (client, extra = {}) => { const a = createAuth({ load: async () => client, redirectTo: 'https://example.test/app/', ...extra }); await a.init(); return a; };
+const authErr = async (p) => { try { await p; } catch (e) { return e; } throw new Error('Expected AuthError'); };
+
+test('sign-up validates input before touching the network', async () => {
+  const c = fakeClient(), a = await mkAuth(c);
+  for (const [email, pw] of [['not-an-email', 'longenough1'], ['', 'longenough1'], ['a@b.co', 'short'], ['a@b.co', '']]) {
+    eq((await authErr(a.signUp(email, pw))).code, 'validation');
+  }
+  eq(c.calls.length, 0);
+});
+test('sign-up: confirmation-email flow keeps you signed out; instant-session flow signs you in', async () => {
+  const c = fakeClient(), a = await mkAuth(c);
+  eq(await a.signUp('  daniel@example.com ', 'longenough1'), { status: 'confirm_email' });
+  eq(a.getState().status, 'signed_out');
+  eq(c.calls[0][1], { email: 'daniel@example.com', password: 'longenough1', options: { emailRedirectTo: 'https://example.test/app/' } });
+  c.next.signUp = { data: { session: GOOD, user: GOOD.user }, error: null };
+  eq(await a.signUp('daniel@example.com', 'longenough1'), { status: 'signed_in' });
+  eq([a.getState().status, a.getState().user.email], ['signed_in', 'daniel@example.com']);
+});
+test('sign-up errors are friendly (duplicate, weak password, offline, rate limit)', async () => {
+  const c = fakeClient(), a = await mkAuth(c);
+  for (const [msg, code] of [['User already registered', 'exists'], ['Password should be at least 6 characters', 'weak_password'], ['Failed to fetch', 'offline'], ['email rate limit exceeded', 'rate_limit']]) {
+    c.next.signUp = { data: null, error: new Error(msg) };
+    eq((await authErr(a.signUp('a@b.co', 'longenough1'))).code, code);
+  }
+  c.next.signUp = { data: null, error: Object.assign(new Error('x'), { name: 'AuthRetryableFetchError' }) };
+  eq((await authErr(a.signUp('a@b.co', 'longenough1'))).code, 'offline');
+});
+test('login: success, wrong password, unconfirmed email, offline', async () => {
+  const c = fakeClient(), a = await mkAuth(c);
+  await a.signIn('daniel@example.com', 'longenough1');
+  eq([a.getState().status, a.getState().user.id], ['signed_in', 'u-1']);
+  const b = await mkAuth(fakeClient());
+  const cb = b.getClient();
+  for (const [msg, code, text] of [['Invalid login credentials', 'credentials', /do not match/], ['Email not confirmed', 'unconfirmed', /confirm your email/], ['Failed to fetch', 'offline', /safe on this device/]]) {
+    cb.next.signIn = { data: { session: null }, error: new Error(msg) };
+    const e = await authErr(b.signIn('daniel@example.com', 'whatever1'));
+    ok(e.code === code && text.test(e.message), 'message for ' + code);
+    eq(b.getState().status, 'signed_out');
+  }
+  eq((await authErr(b.signIn('bad', 'x'))).code, 'validation');
+  eq((await authErr(b.signIn('a@b.co', ''))).code, 'validation');
+});
+test('logout is local, works offline, and never touches saved progress', () => withDb(async (db) => {
+  const q = await quest(db, { type: 'main', effortTier: 'major' });
+  await completeQuest(db, q.id);
+  const before = JSON.stringify(await getState(db));
+  const c = fakeClient(GOOD), a = await mkAuth(c);
+  eq(a.getState().status, 'signed_in');
+  await a.signOut();
+  eq([a.getState().status, a.getState().user, c.calls[0]], ['signed_out', null, ['signOut', { scope: 'local' }]]);
+  eq(a.getState().message, '', 'a deliberate sign-out is not shown as an error');
+  eq(JSON.stringify(await getState(db)), before, 'progress untouched');
+  const c2 = fakeClient(GOOD); c2.next.signOutThrows = true;
+  const a2 = await mkAuth(c2); await a2.signOut();
+  eq(a2.getState().status, 'signed_out');
+}));
+test('an unexpected sign-out explains itself and keeps progress', async () => {
+  const c = fakeClient(GOOD), a = await mkAuth(c);
+  c.emit('SIGNED_OUT', null);
+  eq(a.getState().status, 'signed_out');
+  ok(/progress is still on this device/.test(a.getState().message), 'reassuring message');
+});
+test('expired sessions are detected, refused for cloud use, and recover on refresh', async () => {
+  const old = { ...GOOD, expires_at: Math.floor(Date.now() / 1000) - 10 };
+  const c = fakeClient(old), a = await mkAuth(c);
+  eq([a.getState().status, a.getState().expired], ['signed_in', true]);
+  eq((await authErr(a.requireUser())).code, 'expired');
+  c.session = GOOD; c.emit('TOKEN_REFRESHED', GOOD);
+  eq(a.getState().expired, false);
+  eq((await a.requireUser()).email, 'daniel@example.com');
+  let clock = Date.now();
+  const c2 = fakeClient(GOOD), a2 = await mkAuth(c2, { now: () => clock });
+  clock += 2 * 3600 * 1000; await a2.refreshState();
+  eq(a2.getState().expired, true);
+});
+test('unauthorized cloud access is rejected (signed out, or account features unavailable)', async () => {
+  const a = await mkAuth(fakeClient());
+  eq((await authErr(a.requireUser())).code, 'unauthorized');
+  const down = createAuth({ load: async () => { throw new Error('offline'); } });
+  await down.init();
+  eq(down.getState().status, 'unavailable');
+  eq((await authErr(down.requireUser())).code, 'unavailable');
+  eq((await authErr(down.signIn('a@b.co', 'longenough1'))).code, 'unavailable');
+  await down.signOut();
+  eq(down.getState().status, 'signed_out');
+});
+test('password recovery: generic success, real problems surfaced, recovery event handled', async () => {
+  const c = fakeClient(), a = await mkAuth(c);
+  eq(await a.requestPasswordReset(' daniel@example.com '), { status: 'sent' });
+  eq(c.calls[0], ['reset', 'daniel@example.com', { redirectTo: 'https://example.test/app/' }]);
+  c.next.reset = { data: null, error: new Error('User not found') };
+  eq(await a.requestPasswordReset('nobody@example.com'), { status: 'sent' }, 'does not reveal whether an account exists');
+  c.next.reset = { data: null, error: new Error('Failed to fetch') };
+  eq((await authErr(a.requestPasswordReset('a@b.co'))).code, 'offline');
+  c.next.reset = { data: null, error: Object.assign(new Error('x'), { status: 429 }) };
+  eq((await authErr(a.requestPasswordReset('a@b.co'))).code, 'rate_limit');
+  eq((await authErr(a.requestPasswordReset('nope'))).code, 'validation');
+  c.emit('PASSWORD_RECOVERY', GOOD);
+  eq(a.getState().status, 'recovery');
+  c.emit('SIGNED_IN', GOOD); c.emit('INITIAL_SESSION', GOOD);
+  eq(a.getState().status, 'recovery', 'later events do not skip the new-password step');
+  eq((await authErr(a.updatePassword('short'))).code, 'validation');
+  c.session = GOOD;
+  eq(await a.updatePassword('brandnewpass1'), { status: 'updated' });
+  eq([a.getState().status, c.calls.at(-1)], ['signed_in', ['update', { password: 'brandnewpass1' }]]);
+});
+test('auth state changes notify subscribers and can be unsubscribed', async () => {
+  const c = fakeClient(), a = await mkAuth(c), seen = [];
+  const off = a.subscribe((st) => seen.push(st.status));
+  c.emit('SIGNED_IN', GOOD); off(); c.emit('SIGNED_OUT', null);
+  eq(seen, ['signed_in']);
+});
+test('error classification covers the common cases and hides internals', () => {
+  eq(classify(new Error('Invalid login credentials')).code, 'credentials');
+  eq(classify(new Error('NetworkError when attempting to fetch resource.')).code, 'offline');
+  eq(classify(new Error('Load failed')).code, 'offline');
+  eq(classify(new Error('relation "x" does not exist')), { code: 'other', message: 'Something went wrong. Please try again.' });
+});
 
 // ---- Runner
 const list = document.getElementById('results');
