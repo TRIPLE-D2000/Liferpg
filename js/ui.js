@@ -133,6 +133,7 @@ export function renderProfile(s, h) {
   const attrName = Object.fromEntries(s.attributes.map((a) => [a.id, a.name]));
   const history = [...s.completions].sort((a, b) => b.completedAt.localeCompare(a.completedAt));
   root.replaceChildren(
+    ...accountNodes(s.account, h),
     el('h2', {}, 'Mode'),
     el('div', { class: 'modes' }, MODES.map((m) =>
       el('button', { 'aria-pressed': String(s.profile.difficultyMode === m), onclick: () => h.onMode(m) }, MODE_LABEL(m)))),
@@ -196,4 +197,54 @@ export function renderRewards(s, h) {
           x.kind === 'spent' && x.status === 'redeemed' ? act('Refund', () => h.onRefund(x.redemptionId, x.title, Math.abs(x.amount))) : null))))
       : el('p', { class: 'empty' }, 'No Gold activity yet. Finish a quest to earn your first Gold.'),
   ].filter(Boolean));
+}
+
+const ACCOUNT_NOTE = 'Optional. Life RPG works fully without an account.';
+
+function accountNodes(a, h) {
+  const acct = a || { status: 'loading', message: '' };
+  const body = [];
+  if (acct.status === 'loading') body.push(el('p', { class: 'sub' }, 'Checking account...'));
+  else if (acct.status === 'unavailable') body.push(el('p', { class: 'sub' }, acct.message));
+  else if (acct.status === 'signed_in') {
+    body.push(el('p', {}, el('b', {}, 'Signed in'), ` as ${acct.user.email}`));
+    if (acct.expired) body.push(el('p', { class: 'sub' }, 'Your session has expired. Reconnect to the internet and reopen the app to continue.'));
+    body.push(el('p', { class: 'sub' }, 'Cloud sync is not active yet. It arrives in the next update.'));
+    body.push(el('div', { class: 'actions' }, act('Sign out', h.onSignOut)));
+  } else if (acct.status === 'recovery') {
+    body.push(el('p', {}, 'Set a new password to finish recovering your account.'));
+    body.push(el('div', { class: 'actions' }, act('Set new password', () => h.onOpenAuth('newpassword'))));
+  } else {
+    if (acct.message) body.push(el('p', { class: 'sub' }, acct.message));
+    body.push(el('p', { class: 'sub' }, `${ACCOUNT_NOTE} Sign in to back up your progress to the cloud (sync arrives in the next update).`));
+    body.push(el('div', { class: 'actions' }, act('Sign in', () => h.onOpenAuth('signin')), act('Create account', () => h.onOpenAuth('signup'))));
+  }
+  return [el('h2', {}, 'Account'), el('div', { class: 'acct' }, ...body)];
+}
+
+const AUTH_MODES = {
+  signin:      { title: 'Sign in',          submit: 'Sign in',         email: true,  pass: 'Password',     auto: 'current-password', links: [['Create account', 'signup'], ['Forgot password?', 'forgot']] },
+  signup:      { title: 'Create account',   submit: 'Create account',  email: true,  pass: 'Password (8+ characters)', auto: 'new-password', links: [['I already have an account', 'signin']] },
+  forgot:      { title: 'Reset password',   submit: 'Send reset link', email: true,  pass: null,           auto: 'current-password', links: [['Back to sign in', 'signin']] },
+  newpassword: { title: 'Set new password', submit: 'Save password',   email: false, pass: 'New password (8+ characters)', auto: 'new-password', links: [] },
+};
+
+export function configureAuthDialog(mode, onSwitch) {
+  const m = AUTH_MODES[mode];
+  const f = $('#auth-form');
+  f.reset();
+  $('#auth-title').textContent = m.title;
+  $('#auth-submit').textContent = m.submit;
+  $('#auth-email-row').hidden = !m.email;
+  $('#auth-pass-row').hidden = !m.pass;
+  if (m.pass) $('#auth-pass-label').textContent = m.pass;
+  f.elements.password.setAttribute('autocomplete', m.auto);
+  setAuthMessage('');
+  $('#auth-links').replaceChildren(...m.links.map(([label, to]) => el('button', { type: 'button', class: 'sm', onclick: () => onSwitch(to) }, label)));
+}
+
+export function setAuthMessage(text, isError = false) {
+  const p = $('#auth-msg');
+  p.textContent = text;
+  p.className = isError ? 'err' : '';
 }
