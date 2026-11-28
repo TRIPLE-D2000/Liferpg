@@ -75,3 +75,9 @@ select.inline{background:#101722;border:1px solid var(--line);border-radius:8px;
 .credit{color:var(--ok);font-weight:600;white-space:nowrap}
 .debit{color:var(--danger);font-weight:600;white-space:nowrap}
 .hist-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+
+#auth-msg{min-height:1.4em;margin:6px 0 0;font-size:.9rem;color:var(--ok)}
+#auth-msg.err{color:var(--danger)}
+#auth-links{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.acct{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px}
+.acct p{margin:0 0 8px}
